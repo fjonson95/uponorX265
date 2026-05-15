@@ -49,36 +49,40 @@ PLATFORMS = [Platform.CLIMATE, Platform.SWITCH, Platform.SENSOR]
 
 
 def _migrate_entity_unique_ids(hass: HomeAssistant, config_entry: ConfigEntry, unique_instance_id: str) -> None:
-    """Migrate entity unique_ids to the prefixed format introduced in 1.1.2.
-
-    Prior to 1.1.2 entities used bare thermostat IDs (e.g. '285533243').
-    Since 1.1.2 they carry a config-entry prefix to avoid collisions when
-    multiple Uponor config entries coexist.  Renaming existing registry
-    entries here ensures HA matches them to the newly-registered entities
-    instead of creating duplicates with a '_2' suffix.
-    """
+    
     ent_reg = entity_registry.async_get(hass)
     entries = entity_registry.async_entries_for_config_entry(ent_reg, config_entry.entry_id)
     prefix = f"{unique_instance_id}_"
 
     for entry in entries:
-        if not entry.unique_id.startswith(prefix):
-            new_unique_id = f"{prefix}{entry.unique_id}"
-            try:
-                ent_reg.async_update_entity(entry.entity_id, new_unique_id=new_unique_id)
-                _LOGGER.info(
-                    "Migrated entity %s unique_id: '%s' -> '%s'",
-                    entry.entity_id,
-                    entry.unique_id,
-                    new_unique_id,
-                )
-            except Exception as exc:  # pylint: disable=broad-except
-                _LOGGER.warning(
-                    "Failed to migrate entity %s unique_id '%s': %s",
-                    entry.entity_id,
-                    entry.unique_id,
-                    exc,
-                )
+        if entry.unique_id.startswith(prefix):
+            continue
+
+        new_unique_id = f"{prefix}{entry.unique_id}"
+
+        # Scenario 2: prefixed entity already exists (created by 1.1.2 as '_2').
+        # Remove the stale bare-id entry instead of failing.
+        existing_entity_id = ent_reg.async_get_entity_id(entry.domain, DOMAIN, new_unique_id)
+        if existing_entity_id is not None:
+            _LOGGER.info(
+                "Removing stale entity %s (unique_id '%s') because '%s' already exists as %s",
+                entry.entity_id, entry.unique_id, new_unique_id, existing_entity_id,
+            )
+            ent_reg.async_remove(entry.entity_id)
+            continue
+
+        # Scenario 1: safe to rename in-place.
+        try:
+            ent_reg.async_update_entity(entry.entity_id, new_unique_id=new_unique_id)
+            _LOGGER.info(
+                "Migrated entity %s unique_id: '%s' -> '%s'",
+                entry.entity_id, entry.unique_id, new_unique_id,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            _LOGGER.warning(
+                "Failed to migrate entity %s unique_id '%s': %s",
+                entry.entity_id, entry.unique_id, exc,
+            )
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
     # Sync options to data if they differ
