@@ -1,0 +1,105 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Uponorx265",
+        "description": "Konfigurera Uponors värme-/kylsystem",
+        "data": {
+          "host": "Värdnamn eller IP-adress till Uponor-styrenheten",
+          "name": "Namn på integrationsinstansen",
+          "unique_id": "Valfritt unikt ID (måste vara unikt för varje post)"
+        }
+      },
+      "rooms": {
+        "title": "Uponor-termostater",
+        "description": "Ange namn för Uponors termostater",
+        "data": {
+          "c1_t1": "Namn på C1 Termostat 1",
+          "c1_t2": "Namn på C1 Termostat 2",
+          "c1_t3": "Namn på C1 Termostat 3",
+          "c1_t4": "Namn på C1 Termostat 4",
+          "c1_t5": "Namn på C1 Termostat 5",
+          "c1_t6": "Namn på C1 Termostat 6",
+          "c1_t7": "Namn på C1 Termostat 7",
+          "c1_t8": "Namn på C1 Termostat 8",
+          "c1_t9": "Namn på C1 Termostat 9",
+          "c1_t10": "Namn på C1 Termostat 10",
+          "c1_t11": "Namn på C1 Termostat 11",
+          "c1_t12": "Namn på C1 Termostat 12",
+
+          "c2_t1": "Namn på C2 Termostat 1",
+          "c2_t2": "Namn på C2 Termostat 2",
+          "c2_t3": "Namn på C2 Termostat 3",
+          "c2_t4": "Namn på C2 Termostat 4",
+          "c2_t5": "Namn på C2 Termostat 5",
+          "c2_t6": "Namn på C2 Termostat 6",
+          "c2_t7": "Namn på C2 Termostat 7",
+          "c2_t8": "Namn på C2 Termostat 8",
+          "c2_t9": "Namn på C2 Termostat 9",
+          "c2_t10": "Namn på C2 Termostat 10",
+          "c2_t11": "Namn på C2 Termostat 11",
+          "c2_t12": "Namn på C2 Termostat 12",
+
+          "c3_t1": "Namn på C3 Termostat 1",
+          "c3_t2": "Namn på C3 Termostat 2",
+          "c3_t3": "Namn på C3 Termostat 3",
+          "c3_t4": "Namn på C3 Termostat 4",
+          "c3_t5": "Namn på C3 Termostat 5",
+          "c3_t6": "Namn på C3 Termostat 6",
+          "c3_t7": "Namn på C3 Termostat 7",
+          "c3_t8": "Namn på C3 Termostat 8",
+          "c3_t9": "Namn på C3 Termostat 9",
+          "c3_t10": "Namn på C3 Termostat 10",
+          "c3_t11": "Namn på C3 Termostat 11",
+          "c3_t12": "Namn på C3 Termostat 12",
+
+          "c4_t1": "Namn på C4 Termostat 1",
+          "c4_t2": "Namn på C4 Termostat 2",
+          "c4_t3": "Namn på C4 Termostat 3",
+          "c4_t4": "Namn på C4 Termostat 4",
+          "c4_t5": "Namn på C4 Termostat 5",
+          "c4_t6": "Namn på C4 Termostat 6",
+          "c4_t7": "Namn på C4 Termostat 7",
+          "c4_t8": "Namn på C4 Termostat 8",
+          "c4_t9": "Namn på C4 Termostat 9",
+          "c4_t10": "Namn på C4 Termostat 10",
+          "c4_t11": "Namn på C4 Termostat 11",
+          "c4_t12": "Namn på C4 Termostat 12"
+        }
+      }
+    },
+    "error": {
+      "invalid_host": "Ogiltigt värdnamn eller IP-adress."
+    },
+    "abort": {}
+  },
+  "options": {
+    "step": {
+      "user": {
+        "title": "Uponorx265",
+        "description": "Konfigurera alternativ för Uponor-systemet",
+        "data": {
+          "host": "Värdnamn eller IP-adress till Uponor-styrenheten"
+        }
+      }
+    }
+  },
+  "services": {
+    "set_variable": {
+      "name": "Sätt variabel",
+      "description": "Skicka en variabeluppdatering till Uponor API",
+      "fields": {
+        "var_name": {
+          "name": "Variabelnamn",
+          "description": "Namnet på variabeln du vill uppdatera",
+          "example": "sys_heat_cool_mode"
+        },
+        "var_value": {
+          "name": "Variabelvärde",
+          "description": "Värdet du vill tilldela variabeln",
+          "example": "0"
+        }
+      }
+    }
+  }
+}

@@ -44,6 +44,7 @@ class UponorClimate(ClimateEntity):
         self._unique_instance_id = unique_instance_id
         self._state_proxy = state_proxy
         self._thermostat = thermostat
+        self._controller = thermostat.split('_')[0]
         self._name = name
         self._is_on = True
         self._update_power_state()
@@ -70,8 +71,10 @@ class UponorClimate(ClimateEntity):
             "identifiers": {(self._unique_instance_id, self._state_proxy.get_thermostat_id(self._thermostat))},
             "name": self._name,
             "manufacturer": DEVICE_MANUFACTURER,
-            "model": self._state_proxy.get_model(),
-            "sw_version": self._state_proxy.get_version(self._thermostat)
+            "model": self._state_proxy.get_thermostat_model(self._thermostat),
+            "sw_version": self._state_proxy.get_version(self._thermostat),
+            "serial_number": self._state_proxy.get_thermostat_id(self._thermostat),
+            "via_device": (self._unique_instance_id,self._state_proxy.get_controller_id(self._controller))
         }
 
     @property

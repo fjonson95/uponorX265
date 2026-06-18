@@ -12,6 +12,7 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers import device_registry, entity_registry
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from getmac import get_mac_address
 import homeassistant.util.dt as dt_util
 
 from .const import (
@@ -32,8 +33,14 @@ from .const import (
     STATUS_ERROR_RF_SENSOR,
     STATUS_ERROR_TAMPER,
     STATUS_ERROR_TOO_HIGH_TEMP,
+    STATUS_ERROR_COMFAILOUT,
+    STATUS_ERROR_CONTROLER,
+    STATUS_ONLINE,
+    STATUS_OFFLINE,
+    STATUS_ERROR_MAINCONTROLER_FAIL,
     TOO_HIGH_TEMP_LIMIT,
-    DEFAULT_TEMP
+    DEFAULT_TEMP,
+    DEVICE_MANUFACTURER
 )
 from .jnap import UponorJnap
 from .helper import get_unique_id_from_config_entry
@@ -44,6 +51,8 @@ from homeassistant.components.climate.const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+_INITIAL_RELOAD_DONE: set[str] = set()
 
 PLATFORMS = [Platform.CLIMATE, Platform.SWITCH, Platform.SENSOR]
 
@@ -104,10 +113,23 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
 
     thermostats = state_proxy.get_cached_thermostats()
     if thermostats:
-        hass.async_create_task(state_proxy.async_update())
+        if config_entry.entry_id not in _INITIAL_RELOAD_DONE:
+            state_proxy._started_from_cache = True
+            await state_proxy.async_update()
+        else:
+            hass.async_create_task(state_proxy.async_update())
     else:
         await state_proxy.async_update()
         thermostats = state_proxy.get_active_thermostats()
+
+    dev_reg = device_registry.async_get(hass)
+    dev_reg.async_get_or_create(
+        config_entry_id = config_entry.entry_id,
+        identifiers = {(unique_id,state_proxy.get_gateway_id())},
+        name = "Uponor Gateway",
+        model = state_proxy.get_model(),
+        manufacturer = DEVICE_MANUFACTURER
+    )
 
     hass.data[unique_id] = {
         "state_proxy": state_proxy,
@@ -159,6 +181,7 @@ class UponorStateProxy:
         self._hass = hass
         self._client = UponorJnap(host, session)
         self._store = store
+        self._host = host
         self._data = {}
         self._storage_data = {}
         self._storage_metadata = {}
@@ -170,6 +193,90 @@ class UponorStateProxy:
         self._update_lock = asyncio.Lock()
         self._reload_in_progress = False
         self._last_reload_attempt = None
+        self._started_from_cache = False
+    
+    # Controlers config  
+    def get_active_controllers(self):
+        active = []
+        for c in range(1, 5):
+            var = 'sys_controller_' + str(c) + '_presence'
+            if var in self._data and self._data[var] == "1":
+                active.append('C' + str(c))
+        return active  
+        
+    def get_controller_id(self, controller):
+        var = controller.replace('C', 'controller') + '_id'
+        if var in self._data:
+            return self._data[var]
+        cached = self._storage_metadata.get("controller_ids", {})
+        return cached.get(controller)
+        
+    def get_controller_status(self, controller):
+        var = controller.replace('C','sys_controller_') + '_lost'
+        if var in self._data and self._data[var] == "1":
+            return STATUS_ERROR_CONTROLER
+        var = controller + 'stat_out_module_com_lost'
+        if var in self._data and self._data[var] == "1":
+            return STATUS_ERROR_COMFAILOUT
+        var = controller + 'stat_general_system_alarm'
+        if var in self._data and self._data[var] == "1":
+            return STATUS_ERROR_GENERAL
+        return STATUS_OK
+        
+    def get_controller_hardware(self, controller):
+        var = controller + '_hardware_type'
+        if var in self._data:
+            hwid = int(self._data[var])
+            match hwid:
+                case 0: 
+# Smartix Base Pulse
+                    return("X-245")
+# Smatrix Wave Pulse
+#                   return("X-265")
+# Smatrix Base PRO
+#                   return("X-147")
+# Modbus RTU model  return("X-147") 
+                case _:
+                    return(hwid)
+        return None
+
+
+    def get_controller_name(self, controller):
+        var = 'cust_' + controller.replace('C','Controller') + '_Name'
+        if var in self._data:
+            return self._data[var]
+        cached = self._storage_metadata.get("controller_names", {})
+        return cached.get(controller)
+
+    def get_gateway_id(self):
+#        var = 'cust_ip_device'
+#        if var in self._data:
+#            return self._data[var]
+        return get_mac_address(ip=self._host).replace(':','')
+        self._storage_metadata.get("gateway_id")
+
+    def get_gateway_status(self):
+        if self.is_available() is None:
+            return STATUS_OFFLINE
+        var = 'cust_controller_1_lost'
+        if var in self._data and self._data[var] == "1":
+            return STATUS_ERROR_MAINCONTROLER_FAIL        
+        return STATUS_ONLINE 
+        
+    def get_controller_version(self, controller):
+        var = controller + '_sw_version'
+        if var in self._data:
+            hexver = hex(int(self._data[var])).replace('0x','')
+            return hexver[:-2] + '.' + hexver[-2:]
+        return None
+
+    def get_controller_avgtemp(self, controller):
+        var = controller + '_average_room_temperature'
+        if var in self._data:
+            temp = int(self._data[var])
+            if temp != 32767 and temp <= TOO_HIGH_TEMP_LIMIT:
+                return round((temp - 320) / 18, 1)
+        return None
 
     def _get_room_name_from_data(self, thermostat):
         var = 'cust_' + thermostat + '_name'
@@ -223,6 +330,23 @@ class UponorStateProxy:
         ))
 
         new_metadata = {
+            "gateway_id": self._data.get('cust_ip_device'),
+            "controller_names" : {
+                **self._storage_metadata.get("controllers", {}),
+                **{
+                    controller: controller_name
+                    for controller in self.get_active_controllers()
+                    if (controller_name := self.get_controller_name(controller))
+                },
+            },
+            "controller_ids": {
+                **self._storage_metadata.get("controller_ids", {}),
+                **{
+                    controller: controller_id
+                    for controller in self.get_active_controllers()
+                    if (controller_id := self.get_controller_id(controller))
+                },
+            },
             "thermostats": merged_thermostats,
             "ids": {
                 **self._storage_metadata.get("ids", {}),
@@ -294,17 +418,60 @@ class UponorStateProxy:
             return cached_ids[thermostat]
 
         return thermostat
-
+        
+    def get_thermostat_model(self, thermostat):
+        var = thermostat + '_thermostat_type'
+        if var in self._data:
+            hwid = int(self._data[var])
+            _LOGGER.debug(f"rh_control {self.has_humidity_control(thermostat)}")
+            _LOGGER.debug(f"rh_sensor {self.has_humidity_sensor(thermostat)}")
+            _LOGGER.debug(f"public device {self.is_public_device(thermostat)}")
+            _LOGGER.debug(f"has floor temp {self.has_floor_temperature(thermostat)}")
+            _LOGGER.debug(f"Sensor only {self.is_sensor_only(thermostat)}")
+            match hwid:
+                case 0: 
+                    return("T145") #Nobb for temp
+# Smartix Base Pulse                   
+#                   return("T141") #No temp adjustment/RH
+#                   return("T143") #No temp adjustment/External temp/Tamper Alarm
+#                   return("T144") #Nobb for temp/inwall mount same as T145
+#                   return("T146") #Digital display/External temp
+#                   return("T148") #Digital display/External temp/RH/TimeDate
+#                   return("T149") #Digital display/External temp/RH 
+# Smatrix Wave Pulse
+#                   return("T161") #No temp adjustment/RH
+#                   return("T162") #Digital display/External temp                  
+#                   return("T163") #No temp adjustment/External temp/Tamper Alarm
+#                   return("T165") #Nobb for temp
+#                   return("T166") #Digital display/External temp
+#                   return("T168") #Digital display/External temp/RH/TimeDate
+#                   return("T169") #Digital display/External temp/RH
+#                    return("T247")
+                case _:
+                    return(hwid)
+        return None        
+        
     def get_model(self):
+        return("R-208")
+        
+    def get_sw_version(self):
         var = 'cust_SW_version_update'
         if var in self._data:
             return self._data[var].split('_')[0]
         return '-'
 
-    def get_version(self, thermostat):
-        var = thermostat[0:3] + 'sw_version'
+    def get_model_name(self, devicename):
+        var = 'cust_SW_version_update'
         if var in self._data:
             return self._data[var].split('_')[0]
+        return '-'
+
+
+    def get_version(self, thermostat):
+        var = thermostat + '_sw_version'
+        if var in self._data:
+            return hex(int(self._data[var])).replace("0x","")
+        return None
 
     # Temperatures & humidity
 
@@ -333,7 +500,22 @@ class UponorStateProxy:
         var = thermostat + '_rh'
         if var in self._data:
             return int(self._data[var])
-        
+
+    def has_humidity_control(self, thermostat):
+        var = thermostat + '_rh_control'
+        if var in self._data:
+            return int(self._data[var])
+            
+    def is_public_device(self, thermostat):
+        var = thermostat + '_system_device_public'
+        if var in self._data:
+            return int(self._data[var])
+
+    def is_sensor_only(self, thermostat):
+        var = thermostat + '_sensor_only'
+        if var in self._data:
+            return int(self._data[var])
+
     def has_floor_temperature(self, thermostat):
         var = thermostat + '_external_temperature'
         if var in self._data:
@@ -353,8 +535,9 @@ class UponorStateProxy:
     def get_setpoint(self, thermostat):
         var = thermostat + '_setpoint'
         if var in self._data:
-            temp = math.floor((int(self._data[var]) - 320) / 1.8) / 10
-            return math.floor((int(self._data[var]) - self.get_active_setback(thermostat, temp) - 320) / 1.8) / 10
+            raw = int(self._data[var])
+            temp = math.floor((raw - 320) / 1.8) / 10
+            return math.floor((raw - self.get_active_setback(thermostat, temp) - 320) / 1.8) / 10
 
     def get_setpoint_raw(self, thermostat):
         """Get the raw setpoint value (with offset applied, as stored in the system)"""
@@ -402,9 +585,6 @@ class UponorStateProxy:
         var = thermostat + '_stat_valve_position_err'
         if var in self._data and self._data[var] == "1":
             return STATUS_ERROR_VALVE
-        var = thermostat[0:3] + 'stat_general_system_alarm'
-        if var in self._data and self._data[var] == "1":
-            return STATUS_ERROR_GENERAL
         var = thermostat + '_stat_air_sensor_error'
         if var in self._data and self._data[var] == "1":
             return STATUS_ERROR_AIR_SENSOR
@@ -523,6 +703,13 @@ class UponorStateProxy:
                 self._last_successful_update = dt_util.now()
                 self._unavailable_since = None
                 await self._async_persist_discovery_metadata()
+
+                if self._started_from_cache:
+                    self._started_from_cache = False
+                    _INITIAL_RELOAD_DONE.add(self._config_entry.entry_id)
+                    _LOGGER.info("Uponor: live data hämtad efter cache-start, triggar reload för korrekt device info")
+                    return
+
                 self._hass.async_create_task(self.call_state_update())
                 return
             except Exception as ex:

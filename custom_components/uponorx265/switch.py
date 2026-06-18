@@ -1,7 +1,8 @@
+import logging
+
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity import DeviceInfo
 
 from homeassistant.const import CONF_NAME
 from .const import (
@@ -13,11 +14,11 @@ from .helper import (
     get_unique_id_from_config_entry
 )
 
+_LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(hass, entry, async_add_entities):
     unique_id = get_unique_id_from_config_entry(entry)
-
-    state_proxy = hass.data[unique_id]["state_proxy"]
+    state_proxy = hass.data[unique_id]["state_proxy"]    
     entities = [AwaySwitch(unique_id, state_proxy, entry.data[CONF_NAME])]
 
     if state_proxy.is_cool_available():
@@ -31,6 +32,15 @@ class AwaySwitch(SwitchEntity):
         self._state_proxy = state_proxy
         self._name = name
         self._unique_instance_id = unique_instance_id
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(self._unique_instance_id, self._state_proxy.get_gateway_id())},
+            "name": self._name,
+            "manufacturer": DEVICE_MANUFACTURER,
+            "model": self._state_proxy.get_model(),
+        }
 
     @property
     def name(self) -> str:
@@ -74,16 +84,6 @@ class AwaySwitch(SwitchEntity):
     @property
     def unique_id(self):
         return f"{self._unique_instance_id}_away"
-
-    @property
-    def device_info(self):
-        return DeviceInfo(
-            identifiers={(self._unique_instance_id, "c")},
-            name=self._name,
-            manufacturer=DEVICE_MANUFACTURER,
-            model=self._state_proxy.get_model(),
-        )
-
 
 class CoolSwitch(SwitchEntity):
     def __init__(self, unique_instance_id, state_proxy, name):
@@ -136,9 +136,9 @@ class CoolSwitch(SwitchEntity):
 
     @property
     def device_info(self):
-        return DeviceInfo(
-            identifiers={(self._unique_instance_id, "c")},
-            name=self._name,
-            manufacturer=DEVICE_MANUFACTURER,
-            model=self._state_proxy.get_model(),
-        )
+        return {
+            "identifiers": {(self._unique_instance_id,self._state_proxy.get_gateway_id())},
+            "name": self._name,
+            "manufacturer": DEVICE_MANUFACTURER,
+            "model": self._state_proxy.get_model(),
+        }
