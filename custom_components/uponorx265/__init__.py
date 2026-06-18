@@ -249,11 +249,11 @@ class UponorStateProxy:
         return cached.get(controller)
 
     def get_gateway_id(self):
-#        var = 'cust_ip_device'
-#        if var in self._data:
-#            return self._data[var]
-        return get_mac_address(ip=self._host).replace(':','')
-        self._storage_metadata.get("gateway_id")
+        var = 'cust_ip_device'
+        if var in self._data:
+            return self._data[var]
+#        return get_mac_address(ip=self._host).replace(':','')
+#        self._storage_metadata.get("gateway_id")
 
     def get_gateway_status(self):
         if self.is_available() is None:
