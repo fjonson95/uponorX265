@@ -26,6 +26,7 @@ from .helper import get_unique_id_from_config_entry
 
 _LOGGER = logging.getLogger(__name__)
 
+
 async def async_setup_entry(hass, entry, async_add_entities):
     unique_id = get_unique_id_from_config_entry(entry)
     state_proxy = hass.data[unique_id]["state_proxy"]
@@ -38,8 +39,10 @@ async def async_setup_entry(hass, entry, async_add_entities):
     if entities:
         async_add_entities(entities, update_before_add=False)
 
+
 class UponorClimate(ClimateEntity):
     _enable_turn_on_off_backwards_compatibility = False
+
     def __init__(self, unique_instance_id, state_proxy, thermostat, name):
         self._unique_instance_id = unique_instance_id
         self._state_proxy = state_proxy
@@ -74,7 +77,7 @@ class UponorClimate(ClimateEntity):
             "model": self._state_proxy.get_thermostat_model(self._thermostat),
             "sw_version": self._state_proxy.get_version(self._thermostat),
             "serial_number": self._state_proxy.get_thermostat_id(self._thermostat),
-            "via_device": (self._unique_instance_id,self._state_proxy.get_controller_id(self._controller))
+            "via_device": (self._unique_instance_id, self._state_proxy.get_controller_id(self._controller)),
         }
 
     @property
@@ -104,6 +107,7 @@ class UponorClimate(ClimateEntity):
     @property
     def temperature_unit(self):
         return UnitOfTemperature.CELSIUS
+
     @property
     def supported_features(self):
         return ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
@@ -114,16 +118,16 @@ class UponorClimate(ClimateEntity):
     @property
     def preset_modes(self):
         return [PRESET_ECO, PRESET_AWAY, PRESET_COMFORT]
-    
+
     @property
     def current_humidity(self):
         humidity = self._state_proxy.get_humidity(self._thermostat)
         return humidity if humidity not in (None, 0) else None
-    
+
     @property
     def current_temperature(self):
         return self._state_proxy.get_temperature(self._thermostat)
-    
+
     @property
     def target_temperature(self):
         return self._state_proxy.get_setpoint(self._thermostat)
@@ -151,9 +155,8 @@ class UponorClimate(ClimateEntity):
             return PRESET_ECO
         if self._state_proxy.is_away():
             return PRESET_AWAY
-        else:
-            return PRESET_COMFORT
-    
+        return PRESET_COMFORT
+
     @property
     def hvac_mode(self):
         if not self._is_on:

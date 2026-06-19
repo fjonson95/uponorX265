@@ -52,8 +52,6 @@ from homeassistant.components.climate.const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-_INITIAL_RELOAD_DONE: set[str] = set()
-
 PLATFORMS = [Platform.CLIMATE, Platform.SWITCH, Platform.SENSOR]
 
 
@@ -113,8 +111,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
 
     thermostats = state_proxy.get_cached_thermostats()
     if thermostats:
-        if config_entry.entry_id not in _INITIAL_RELOAD_DONE:
-            state_proxy._started_from_cache = True
+        if config_entry.entry_id:
             await state_proxy.async_update()
         else:
             hass.async_create_task(state_proxy.async_update())
@@ -124,16 +121,16 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
 
     dev_reg = device_registry.async_get(hass)
     dev_reg.async_get_or_create(
-        config_entry_id = config_entry.entry_id,
-        identifiers = {(unique_id,state_proxy.get_gateway_id())},
-        name = "Uponor Gateway",
-        model = state_proxy.get_model(),
-        manufacturer = DEVICE_MANUFACTURER
+        config_entry_id=config_entry.entry_id,
+        identifiers={(unique_id, state_proxy.get_gateway_id())},
+        name="Uponor Gateway",
+        model=state_proxy.get_model(),
+        manufacturer=DEVICE_MANUFACTURER,
     )
 
     hass.data[unique_id] = {
         "state_proxy": state_proxy,
-        "thermostats": thermostats
+        "thermostats": thermostats,
     }
 
     async def handle_set_variable(call):
@@ -161,6 +158,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
 
     return True
 
+
 async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Update options."""
     _LOGGER.debug("Update setup entry: %s, data: %s, options: %s", entry.entry_id, entry.data, entry.options)
@@ -170,11 +168,14 @@ async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
         await hass.config_entries.async_unload(entry.entry_id)
     await hass.config_entries.async_reload(entry.entry_id)
 
+
 async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     _LOGGER.debug("Unloading setup entry: %s, data: %s, options: %s", config_entry.entry_id, config_entry.data, config_entry.options)
-    unload_ok = await hass.config_entries.async_unload_platforms(config_entry, [Platform.SWITCH, Platform.CLIMATE, Platform.SENSOR])
-    return unload_ok
+    return await hass.config_entries.async_unload_platforms(
+        config_entry, [Platform.SWITCH, Platform.CLIMATE, Platform.SENSOR]
+    )
+
 
 class UponorStateProxy:
     def __init__(self, hass, host, session, store, unique_id, config_entry):
@@ -193,7 +194,7 @@ class UponorStateProxy:
         self._update_lock = asyncio.Lock()
         self._reload_in_progress = False
         self._last_reload_attempt = None
-        self._started_from_cache = False
+        self._gateway_id = None
     
     # Controlers config  
     def get_active_controllers(self):
@@ -208,8 +209,7 @@ class UponorStateProxy:
         var = controller.replace('C', 'controller') + '_id'
         if var in self._data:
             return self._data[var]
-        cached = self._storage_metadata.get("controller_ids", {})
-        return cached.get(controller)
+        return self._storage_metadata.get("controller_ids", {}).get(controller)
         
     def get_controller_status(self, controller):
         var = controller.replace('C','sys_controller_') + '_lost'
@@ -240,20 +240,21 @@ class UponorStateProxy:
                     return(hwid)
         return None
 
-
     def get_controller_name(self, controller):
-        var = 'cust_' + controller.replace('C','Controller') + '_Name'
+        var = 'cust_' + controller.replace('C', 'Controller') + '_Name'
         if var in self._data:
             return self._data[var]
-        cached = self._storage_metadata.get("controller_names", {})
-        return cached.get(controller)
+        return self._storage_metadata.get("controller_names", {}).get(controller)
 
     def get_gateway_id(self):
-        var = 'cust_ip_device'
-        if var in self._data:
-            return self._data[var]
-#        return get_mac_address(ip=self._host).replace(':','')
-#        self._storage_metadata.get("gateway_id")
+        if self._gateway_id is None:
+            mac = get_mac_address(ip=self._host)
+            if mac is not None:
+                self._gateway_id = mac.replace(':', '')
+            else:
+                _LOGGER.warning("Could not resolve MAC address for %s, using host as fallback", self._host)
+                self._gateway_id = self._host.replace('.', '')
+        return self._gateway_id
 
     def get_gateway_status(self):
         if self.is_available() is None:
@@ -266,7 +267,7 @@ class UponorStateProxy:
     def get_controller_version(self, controller):
         var = controller + '_sw_version'
         if var in self._data:
-            hexver = hex(int(self._data[var])).replace('0x','')
+            hexver = hex(int(self._data[var])).replace('0x', '')
             return hexver[:-2] + '.' + hexver[-2:]
         return None
 
@@ -280,21 +281,21 @@ class UponorStateProxy:
 
     def _get_room_name_from_data(self, thermostat):
         var = 'cust_' + thermostat + '_name'
-        if var in self._data:
-            return self._data[var]
-        return None
+        return self._data.get(var)
 
     def _get_thermostat_id_from_data(self, thermostat):
         var = thermostat.replace('T', 'thermostat') + '_id'
-        if var in self._data:
-            return self._data[var]
-        return None
+        return self._data.get(var)
 
     def _compose_storage_payload(self):
         payload = dict(self._storage_data)
         if self._storage_metadata:
             payload["_meta"] = self._storage_metadata
         return payload
+
+    # -------------------------------------------------------------------------
+    # Storage
+    # -------------------------------------------------------------------------
 
     async def async_load_storage(self):
         data = await self._store.async_load()
@@ -379,7 +380,9 @@ class UponorStateProxy:
             self._storage_metadata = new_metadata
             await self._store.async_save(self._compose_storage_payload())
 
-    # Thermostats config
+    # -------------------------------------------------------------------------
+    # Thermostat config
+    # -------------------------------------------------------------------------
 
     def get_active_thermostats(self):
         active = []
@@ -397,28 +400,23 @@ class UponorStateProxy:
         room_name = self._get_room_name_from_data(thermostat)
         if room_name is not None:
             return room_name
-
         cached_rooms = self._storage_metadata.get("rooms", {})
         if thermostat in cached_rooms:
             return cached_rooms[thermostat]
-
         configured_name = self._config_entry.data.get(thermostat.lower())
         if configured_name:
             return configured_name
-
         return thermostat
 
     def get_thermostat_id(self, thermostat):
         thermostat_id = self._get_thermostat_id_from_data(thermostat)
         if thermostat_id is not None:
             return thermostat_id
-
         cached_ids = self._storage_metadata.get("ids", {})
         if thermostat in cached_ids:
             return cached_ids[thermostat]
-
         return thermostat
-        
+
     def get_thermostat_model(self, thermostat):
         var = thermostat + '_thermostat_type'
         if var in self._data:
@@ -448,12 +446,12 @@ class UponorStateProxy:
 #                   return("T169") #Digital display/External temp/RH
 #                    return("T247")
                 case _:
-                    return(hwid)
-        return None        
-        
+                    return hwid
+        return None
+
     def get_model(self):
-        return("R-208")
-        
+        return "R-208"
+
     def get_sw_version(self):
         var = 'cust_SW_version_update'
         if var in self._data:
@@ -470,9 +468,10 @@ class UponorStateProxy:
     def get_version(self, thermostat):
         var = thermostat + '_sw_version'
         if var in self._data:
-            return hex(int(self._data[var])).replace("0x","")
+            return hex(int(self._data[var])).replace("0x", "")
         return None
 
+    # -------------------------------------------------------------------------
     # Temperatures & humidity
 
     def get_temperature(self, thermostat):
@@ -505,7 +504,7 @@ class UponorStateProxy:
         var = thermostat + '_rh_control'
         if var in self._data:
             return int(self._data[var])
-            
+
     def is_public_device(self, thermostat):
         var = thermostat + '_system_device_public'
         if var in self._data:
@@ -529,8 +528,10 @@ class UponorStateProxy:
             if temp != 32767 and temp <= TOO_HIGH_TEMP_LIMIT:
                 return round((temp - 320) / 18, 1)
         return None
-    
+
+    # -------------------------------------------------------------------------
     # Temperature setpoint
+    # -------------------------------------------------------------------------
 
     def get_setpoint(self, thermostat):
         var = thermostat + '_setpoint'
@@ -566,7 +567,9 @@ class UponorStateProxy:
 
         return cool_setback + eco_setback
 
+    # -------------------------------------------------------------------------
     # State
+    # -------------------------------------------------------------------------
 
     def is_active(self, thermostat):
         var = thermostat + '_stat_cb_actuator'
@@ -603,15 +606,17 @@ class UponorStateProxy:
         var = thermostat + '_room_temperature'
         if var in self._data and int(self._data[var]) > TOO_HIGH_TEMP_LIMIT:
             return STATUS_ERROR_TOO_HIGH_TEMP
+
         return STATUS_OK
 
+    # -------------------------------------------------------------------------
     # HVAC modes
+    # -------------------------------------------------------------------------
 
     async def async_switch_to_cooling(self):
         for thermostat in self._hass.data[self._unique_id]['thermostats']:
             if self.get_setpoint(thermostat) == self.get_min_limit(thermostat):
                 await self.async_set_setpoint(thermostat, self.get_max_limit(thermostat))
-
         await self._client.send_data({'sys_heat_cool_mode': '1'})
         self._data['sys_heat_cool_mode'] = '1'
         self._hass.async_create_task(self.call_state_update())
@@ -620,14 +625,13 @@ class UponorStateProxy:
         for thermostat in self._hass.data[self._unique_id]['thermostats']:
             if self.get_setpoint(thermostat) == self.get_max_limit(thermostat):
                 await self.async_set_setpoint(thermostat, self.get_min_limit(thermostat))
-
         await self._client.send_data({'sys_heat_cool_mode': '0'})
         self._data['sys_heat_cool_mode'] = '0'
         self._hass.async_create_task(self.call_state_update())
 
     async def async_turn_on(self, thermostat):
         await self.async_load_storage()
-        last_temp = self._storage_data[thermostat] if thermostat in self._storage_data else DEFAULT_TEMP
+        last_temp = self._storage_data.get(thermostat, DEFAULT_TEMP)
         await self.async_set_setpoint(thermostat, last_temp)
 
     async def async_turn_off(self, thermostat):
@@ -643,8 +647,9 @@ class UponorStateProxy:
         elif preset_mode == PRESET_COMFORT:
             await self.async_set_away(False)
 
-
+    # -------------------------------------------------------------------------
     # Cooling
+    # -------------------------------------------------------------------------
 
     def is_cool_available(self):
         var = 'sys_cooling_available'
@@ -658,7 +663,9 @@ class UponorStateProxy:
         if var in self._data:
             return self._data[var] == "1"
 
+    # -------------------------------------------------------------------------
     # Away & Eco
+    # -------------------------------------------------------------------------
 
     def is_away(self):
         var = 'sys_forced_eco_mode'
@@ -683,15 +690,18 @@ class UponorStateProxy:
         var = thermostat + '_eco_offset'
         if var in self._data:
             return round(int(self._data[var]) / 18, 1)
-        
+
     def get_last_update(self):
         return self.next_sp_from_dt
-    
+
     async def call_state_update(self):
         async_dispatcher_send(self._hass, SIGNAL_UPONOR_STATE_UPDATE)
 
-    # Rest
-    async def async_update(self,_=None):
+    # -------------------------------------------------------------------------
+    # Polling & reload
+    # -------------------------------------------------------------------------
+
+    async def async_update(self, _=None):
         if self._update_lock.locked():
             _LOGGER.debug("Skipping Uponor update because a previous update is still running")
             return
@@ -703,12 +713,6 @@ class UponorStateProxy:
                 self._last_successful_update = dt_util.now()
                 self._unavailable_since = None
                 await self._async_persist_discovery_metadata()
-
-                if self._started_from_cache:
-                    self._started_from_cache = False
-                    _INITIAL_RELOAD_DONE.add(self._config_entry.entry_id)
-                    _LOGGER.info("Uponor: live data hämtad efter cache-start, triggar reload för korrekt device info")
-                    return
 
                 self._hass.async_create_task(self.call_state_update())
                 return
@@ -738,7 +742,7 @@ class UponorStateProxy:
                 self._reload_in_progress = False
 
     async def async_set_variable(self, var_name, var_value):
-        _LOGGER.debug("Called set variable: name: %s, value: %s, data: %s", var_name, var_value, self._data)
+        _LOGGER.debug("Called set variable: name: %s, value: %s", var_name, var_value)
         await self._client.send_data({var_name: var_value})
         self._data[var_name] = var_value
         self._hass.async_create_task(self.call_state_update())

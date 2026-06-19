@@ -19,7 +19,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
     state_proxy = hass.data[unique_id]["state_proxy"]
 
     entities = []
-    
+
     # Gateway diagnostic sensor (one per integration)
     entities.append(UponorGatewayStatusSensor(unique_id, state_proxy))
 
@@ -31,14 +31,14 @@ async def async_setup_entry(hass, entry, async_add_entities):
             entities.append(UponorRoomAvg(unique_id, state_proxy, thermostat))
             # Controller diagnostic sensor (one per controller)
             entities.append(UponorControllerStatusSensor(unique_id, state_proxy, controller))
-    
+
     for thermostat in hass.data[unique_id]["thermostats"]:
         room_name = state_proxy.get_room_name(thermostat)
         _LOGGER.debug(f"Adding sensors for {room_name} (thermostat ID: {thermostat})")
         entities.append(UponorRoomCurrentTemperatureSensor(unique_id, state_proxy, thermostat))
         # Thermostat diagnostic status sensor
         entities.append(UponorThermostatStatusSensor(unique_id, state_proxy, thermostat))
-        
+
         if state_proxy.has_floor_temperature(thermostat):
             entities.append(UponorFloorTemperatureSensor(unique_id, state_proxy, thermostat))
             _LOGGER.debug(f"Added floor sensor for: {room_name}")
@@ -49,6 +49,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
     _LOGGER.debug(f"Total number of sensors added: {len(entities)}")
     async_add_entities(entities, update_before_add=False)
+
 
 # ---------------------------------------------------------------------------
 # Diagnostic sensors
@@ -143,7 +144,7 @@ class UponorControllerStatusSensor(SensorEntity):
     @property
     def native_value(self):
         return self._state_proxy.get_controller_status(self._controller)
-        
+
     @property
     def icon(self):
         return "mdi:check-circle-outline" if self._state_proxy.is_available() else "mdi:alert-circle"
@@ -223,7 +224,7 @@ class UponorFloorTemperatureSensor(SensorEntity):
         self._thermostat = thermostat
         self._name = state_proxy.get_room_name(self._thermostat)         
         self._controller = thermostat.split('_')[0]
-        self._attr_name = f"{state_proxy.get_room_name(thermostat)} Floor Temperature"
+        self._attr_name = f"{self._name} Floor Temperature"
         self._attr_unique_id = f"{unique_instance_id}_{state_proxy.get_thermostat_id(thermostat)}_floor_temp"
         self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
         self._attr_state_class = SensorStateClass.MEASUREMENT
@@ -237,7 +238,7 @@ class UponorFloorTemperatureSensor(SensorEntity):
             "model": self._state_proxy.get_model(),
             "sw_version": self._state_proxy.get_version(self._thermostat),
             "serial_number": self._state_proxy.get_thermostat_id(self._thermostat),
-            "via_device": (self._unique_instance_id,self._state_proxy.get_controller_id(self._controller))
+            "via_device": (self._unique_instance_id, self._state_proxy.get_controller_id(self._controller)),
         }
 
     @property
@@ -258,6 +259,7 @@ class UponorFloorTemperatureSensor(SensorEntity):
                 self.hass, SIGNAL_UPONOR_STATE_UPDATE, self._update_callback
             )
         )
+
     @callback
     def _update_callback(self):
         """Update sensor state. when data updates"""
@@ -271,8 +273,8 @@ class UponorRoomCurrentTemperatureSensor(SensorEntity):
         self._state_proxy = state_proxy
         self._thermostat = thermostat
         self._controller = thermostat.split('_')[0]
-        self._name = state_proxy.get_room_name(self._thermostat)
-        self._attr_name = f"{state_proxy.get_room_name(thermostat)} Current Temperature"
+        self._name = state_proxy.get_room_name(thermostat)
+        self._attr_name = f"{self._name} Current Temperature"
         self._attr_unique_id = f"{unique_instance_id}_{state_proxy.get_thermostat_id(thermostat)}_current_temp"
         self._attr_device_class = SensorDeviceClass.TEMPERATURE
         self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
@@ -287,7 +289,7 @@ class UponorRoomCurrentTemperatureSensor(SensorEntity):
             "model": self._state_proxy.get_thermostat_model(self._thermostat),
             "sw_version": self._state_proxy.get_version(self._thermostat),
             "serial_number": self._state_proxy.get_thermostat_id(self._thermostat),
-            "via_device": (self._unique_instance_id,self._state_proxy.get_controller_id(self._controller))
+            "via_device": (self._unique_instance_id, self._state_proxy.get_controller_id(self._controller)),
         }
 
     @property
@@ -308,11 +310,13 @@ class UponorRoomCurrentTemperatureSensor(SensorEntity):
                 self.hass, SIGNAL_UPONOR_STATE_UPDATE, self._update_callback
             )
         )
+
     @callback
     def _update_callback(self):
         """Update sensor state. when data updates"""
         _LOGGER.debug(f"Updating state for {self._attr_name} with ID {self._attr_unique_id}")
         self.async_schedule_update_ha_state(True)
+
 
 class UponorHumiditySensor(SensorEntity):
     def __init__(self, unique_instance_id, state_proxy, thermostat):
@@ -320,12 +324,12 @@ class UponorHumiditySensor(SensorEntity):
         self._state_proxy = state_proxy
         self._thermostat = thermostat
         self._controller = thermostat.split('_')[0]
-        self._name = state_proxy.get_room_name(self._thermostat)
-        self._attr_name = f"{state_proxy.get_room_name(thermostat)} humidity"
+        self._name = state_proxy.get_room_name(thermostat)
+        self._attr_name = f"{self._name} humidity"
         self._attr_unique_id = f"{unique_instance_id}_{state_proxy.get_thermostat_id(thermostat)}_rh"
         self._attr_device_class = SensorDeviceClass.HUMIDITY
         self._attr_native_unit_of_measurement = PERCENTAGE
-        self._attr_state_class = SensorStateClass.MEASUREMENT 
+        self._attr_state_class = SensorStateClass.MEASUREMENT
 
     @property
     def device_info(self):
@@ -336,7 +340,7 @@ class UponorHumiditySensor(SensorEntity):
             "model": self._state_proxy.get_thermostat_model(self._thermostat), 
             "sw_version": self._state_proxy.get_version(self._thermostat),
             "serial_number": self._state_proxy.get_thermostat_id(self._thermostat),
-            "via_device": (self._unique_instance_id,self._state_proxy.get_controller_id(self._controller))
+            "via_device": (self._unique_instance_id, self._state_proxy.get_controller_id(self._controller)),
         }
 
     @property
@@ -351,7 +355,7 @@ class UponorHumiditySensor(SensorEntity):
     @property
     def should_poll(self):
         return False
-    
+
     async def async_added_to_hass(self):
         self.async_on_remove(
             async_dispatcher_connect(
@@ -364,17 +368,19 @@ class UponorHumiditySensor(SensorEntity):
         _LOGGER.debug(f"Updating state for {self._attr_name} with ID {self._attr_unique_id}")
         self.async_schedule_update_ha_state(True)
 
+
 class UponorRoomAvg(SensorEntity):
     def __init__(self, unique_instance_id, state_proxy, thermostat):
         self._unique_instance_id = unique_instance_id
         self._state_proxy = state_proxy
         self._controller = thermostat.split('_')[0]
         self._name = state_proxy.get_controller_name(self._controller)
-        self._attr_name = f"{state_proxy.get_controller_name(self._controller)} Room avg temp"
+        self._attr_name = f"{self._name} Room avg temp"
         self._attr_unique_id = f"{unique_instance_id}_{state_proxy.get_controller_id(self._controller)}_average_room_temperature"
         self._attr_device_class = SensorDeviceClass.TEMPERATURE
         self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
         self._attr_state_class = SensorStateClass.MEASUREMENT
+
     @property
     def device_info(self):
         return {
@@ -384,8 +390,9 @@ class UponorRoomAvg(SensorEntity):
             "manufacturer": DEVICE_MANUFACTURER,
             "sw_version": self._state_proxy.get_controller_version(self._controller),
             "serial_number": self._state_proxy.get_controller_id(self._controller),
-            "via_device" : (self._unique_instance_id,self._state_proxy.get_gateway_id())
+            "via_device": (self._unique_instance_id, self._state_proxy.get_gateway_id()),
         }
+
     @property
     def available(self):
         return self._state_proxy.is_available()
@@ -396,8 +403,7 @@ class UponorRoomAvg(SensorEntity):
 
     @property
     def native_value(self):
-        val = self._state_proxy.get_controller_avgtemp(self._controller)
-        return val
+        return self._state_proxy.get_controller_avgtemp(self._controller)
 
     async def async_added_to_hass(self):
         self.async_on_remove(
@@ -405,6 +411,7 @@ class UponorRoomAvg(SensorEntity):
                 self.hass, SIGNAL_UPONOR_STATE_UPDATE, self._update_callback
             )
         )
+
     @callback
     def _update_callback(self):
         """Update sensor state. when data updates"""

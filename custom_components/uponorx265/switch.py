@@ -16,9 +16,11 @@ from .helper import (
 
 _LOGGER = logging.getLogger(__name__)
 
+
 async def async_setup_entry(hass, entry, async_add_entities):
     unique_id = get_unique_id_from_config_entry(entry)
-    state_proxy = hass.data[unique_id]["state_proxy"]    
+    state_proxy = hass.data[unique_id]["state_proxy"]
+
     entities = [AwaySwitch(unique_id, state_proxy, entry.data[CONF_NAME])]
 
     if state_proxy.is_cool_available():
@@ -85,12 +87,22 @@ class AwaySwitch(SwitchEntity):
     def unique_id(self):
         return f"{self._unique_instance_id}_away"
 
+
 class CoolSwitch(SwitchEntity):
     def __init__(self, unique_instance_id, state_proxy, name):
         self._state_proxy = state_proxy
         self._name = name
         self._unique_instance_id = unique_instance_id
 
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(self._unique_instance_id,self._state_proxy.get_gateway_id())},
+            "name": self._name,
+            "manufacturer": DEVICE_MANUFACTURER,
+            "model": self._state_proxy.get_model(),
+        }
+        
     @property
     def name(self) -> str:
         return self._name + " Cooling Mode"
@@ -134,11 +146,3 @@ class CoolSwitch(SwitchEntity):
     def unique_id(self):
         return f"{self._unique_instance_id}_cool"
 
-    @property
-    def device_info(self):
-        return {
-            "identifiers": {(self._unique_instance_id,self._state_proxy.get_gateway_id())},
-            "name": self._name,
-            "manufacturer": DEVICE_MANUFACTURER,
-            "model": self._state_proxy.get_model(),
-        }

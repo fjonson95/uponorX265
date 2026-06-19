@@ -37,7 +37,7 @@ class DomainConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             {
                 vol.Required(CONF_HOST): str,
                 vol.Required(CONF_NAME, default=DEVICE_MANUFACTURER): str,
-                vol.Optional(CONF_UNIQUE_ID): str
+                vol.Optional(CONF_UNIQUE_ID): str,
             }
         )
 
@@ -59,13 +59,13 @@ class DomainConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return self.async_show_form(
                     step_id="user",
                     data_schema=self.schema,
-                    errors={"base": "invalid_host", "debug": repr(e)}
+                    errors={"base": "invalid_host", "debug": repr(e)},
                 )
 
             self._entry_data = user_input
             return self.async_show_form(
                 step_id="rooms",
-                data_schema=self.get_rooms_schema()
+                data_schema=self.get_rooms_schema(),
             )
 
         return self.async_show_form(step_id="user", data_schema=self.schema)
@@ -75,7 +75,7 @@ class DomainConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is None:
             return self.async_show_form(
                 step_id="rooms",
-                data_schema=self.get_rooms_schema()
+                data_schema=self.get_rooms_schema(),
             )
         data = {**self._entry_data, **user_input}
 
