@@ -2,17 +2,22 @@ import asyncio
 import math
 import logging
 
+import voluptuous as vol
+
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import Platform
 
-from homeassistant.const import CONF_HOST
+from homeassistant.const import CONF_HOST, CONF_NAME, ATTR_DEVICE_ID
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers import device_registry, entity_registry
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
 from getmac import get_mac_address
+
 import homeassistant.util.dt as dt_util
 
 from .const import (
@@ -43,7 +48,7 @@ from .const import (
     DEVICE_MANUFACTURER
 )
 from .jnap import UponorJnap
-from .helper import get_unique_id_from_config_entry
+from .helper import get_unique_id_from_config_entry, _get_mac_with_arp_refresh 
 
 from homeassistant.components.climate.const import (
     PRESET_AWAY,
@@ -53,6 +58,56 @@ from homeassistant.components.climate.const import (
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.CLIMATE, Platform.SWITCH, Platform.SENSOR]
+
+SET_VARIABLE_SCHEMA = vol.Schema(
+    {
+        vol.Required("var_name"): str,
+        vol.Required("var_value"): vol.Any(str, int, float),
+        vol.Optional(ATTR_DEVICE_ID): vol.All(cv.ensure_list, [cv.string]),
+    }
+)
+
+
+def _get_all_state_proxies(hass: HomeAssistant) -> dict:
+    """Return {unique_id: state_proxy} for every loaded uponorx265 config entry."""
+    proxies = {}
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        data = hass.data.get(entry.unique_id)
+        if data:
+            proxies[entry.unique_id] = data["state_proxy"]
+    return proxies
+
+
+def _resolve_target_proxies(hass: HomeAssistant, call) -> list:
+    """Resolve which gateway(s) a service call targets.
+
+    Multiple gateways (config entries) can be configured, so a call without
+    'device_id' is only unambiguous when exactly one gateway is loaded.
+    """
+    all_proxies = _get_all_state_proxies(hass)
+    device_ids = call.data.get(ATTR_DEVICE_ID)
+
+    if not device_ids:
+        if len(all_proxies) == 1:
+            return list(all_proxies.values())
+        _LOGGER.warning(
+            "uponorx265.set_variable: %d gateways are configured; specify 'device_id' "
+            "to target a specific one",
+            len(all_proxies),
+        )
+        return []
+
+    dev_reg = device_registry.async_get(hass)
+    targeted = {}
+    for device_id in device_ids:
+        device = dev_reg.async_get(device_id)
+        if device is None:
+            continue
+        for entry_id in device.config_entries:
+            entry = hass.config_entries.async_get_entry(entry_id)
+            if entry and entry.domain == DOMAIN and entry.unique_id in all_proxies:
+                targeted[entry.unique_id] = all_proxies[entry.unique_id]
+    return list(targeted.values())
 
 
 def _migrate_entity_unique_ids(hass: HomeAssistant, config_entry: ConfigEntry, unique_instance_id: str) -> None:
@@ -103,10 +158,13 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
 
     host = config_entry.data[CONF_HOST]
     unique_id = get_unique_id_from_config_entry(config_entry)
-    store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
+    # Storage must be keyed per config entry, otherwise multiple gateways
+    # (config entries) overwrite each other's cached thermostat/controller data.
+    store = Store(hass, STORAGE_VERSION, f"{STORAGE_KEY}_{unique_id}")
     session = async_get_clientsession(hass)
 
     state_proxy = UponorStateProxy(hass, host, session, store, unique_id, config_entry)
+    _LOGGER.debug(f"host {host} {config_entry} {unique_id}")
     await state_proxy.async_load_storage()
 
     thermostats = state_proxy.get_cached_thermostats()
@@ -119,28 +177,15 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
         await state_proxy.async_update()
         thermostats = state_proxy.get_active_thermostats()
 
-    dev_reg = device_registry.async_get(hass)
-    dev_reg.async_get_or_create(
-        config_entry_id=config_entry.entry_id,
-        identifiers={(unique_id, state_proxy.get_gateway_id())},
-        name="Uponor Gateway",
-        model=state_proxy.get_model(),
-        manufacturer=DEVICE_MANUFACTURER,
-    )
-
     hass.data[unique_id] = {
         "state_proxy": state_proxy,
         "thermostats": thermostats,
     }
 
-    async def handle_set_variable(call):
-        var_name = call.data.get('var_name')
-        var_value = call.data.get('var_value')
-        if not var_name:
-            return
-        await hass.data[unique_id]['state_proxy'].async_set_variable(var_name, var_value)
-
-    hass.services.async_register(DOMAIN, "set_variable", handle_set_variable)
+    if not hass.services.has_service(DOMAIN, "set_variable"):
+        hass.services.async_register(
+            DOMAIN, "set_variable", _create_set_variable_handler(hass), schema=SET_VARIABLE_SCHEMA
+        )
 
     # Migrate entity unique_ids from pre-1.1.2 bare format to prefixed format.
     # Must run before platform setup so HA matches existing registry entries
@@ -172,9 +217,34 @@ async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
 async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     _LOGGER.debug("Unloading setup entry: %s, data: %s, options: %s", config_entry.entry_id, config_entry.data, config_entry.options)
-    return await hass.config_entries.async_unload_platforms(
-        config_entry, [Platform.SWITCH, Platform.CLIMATE, Platform.SENSOR]
+    unload_ok = await hass.config_entries.async_unload_platforms(
+        config_entry, PLATFORMS
     )
+    if unload_ok:
+        hass.data.pop(get_unique_id_from_config_entry(config_entry), None)
+    return unload_ok
+
+
+def _create_set_variable_handler(hass: HomeAssistant):
+    """Build the uponorx265.set_variable service handler bound to this hass instance.
+
+    Supports multiple gateways: pass 'device_id' (any device belonging to the
+    target gateway) to disambiguate when more than one gateway is configured.
+    """
+    async def handle_set_variable(call) -> None:
+        var_name = call.data.get('var_name')
+        var_value = call.data.get('var_value')
+        if not var_name:
+            return
+
+        proxies = _resolve_target_proxies(hass, call)
+        if not proxies:
+            return
+
+        for proxy in proxies:
+            await proxy.async_set_variable(var_name, var_value)
+
+    return handle_set_variable
 
 
 class UponorStateProxy:
@@ -195,7 +265,7 @@ class UponorStateProxy:
         self._reload_in_progress = False
         self._last_reload_attempt = None
         self._gateway_id = None
-    
+        _LOGGER.debug(f"Configdata = {self._config_entry}")
     # Controlers config  
     def get_active_controllers(self):
         active = []
@@ -227,8 +297,15 @@ class UponorStateProxy:
         var = controller + '_hardware_type'
         if var in self._data:
             hwid = int(self._data[var])
-            match hwid:
-                case 0: 
+            controller_id = self.get_controller_id(controller)
+            if controller_id is None:
+                return hwid
+            sn = controller_id[:4]
+            prodk = sn[:3]
+            mod = sn[-1:]
+            _LOGGER.debug(f"id {hwid} s/n start {sn}")            
+            if prodk=="419":
+                if mod=="5":
 # Smartix Base Pulse
                     return("X-245")
 # Smatrix Wave Pulse
@@ -236,24 +313,46 @@ class UponorStateProxy:
 # Smatrix Base PRO
 #                   return("X-147")
 # Modbus RTU model  return("X-147") 
-                case _:
-                    return(hwid)
-        return None
+            return hwid
 
     def get_controller_name(self, controller):
+        configured_name = self._config_entry.data.get(controller.lower())
+        if configured_name:
+            return configured_name
         var = 'cust_' + controller.replace('C', 'Controller') + '_Name'
         if var in self._data:
             return self._data[var]
         return self._storage_metadata.get("controller_names", {}).get(controller)
 
-    def get_gateway_id(self):
+    def get_integration_name(self) -> str:
+        """Return the user-configured name for this integration instance (gateway)."""
+        return self._config_entry.data.get(CONF_NAME, DEVICE_MANUFACTURER)
+
+    def get_gateway_id(self) -> str:
+        """Return cached gateway ID (MAC or host fallback)."""
+        if self._gateway_id is None:
+            # Cache not yet populated; return host fallback until async_resolve_gateway_id runs
+            return self._host.replace('.', '')
+        return self._gateway_id
+
+    async def async_resolve_gateway_id(self) -> str:
+        """Resolve gateway MAC via ARP (with UDP socket to prime ARP cache) and cache it."""
         if self._gateway_id is None:
             mac = get_mac_address(ip=self._host)
             if mac is not None:
                 self._gateway_id = mac.replace(':', '')
             else:
-                _LOGGER.warning("Could not resolve MAC address for %s, using host as fallback", self._host)
-                self._gateway_id = self._host.replace('.', '')
+                mac = await self._hass.async_add_executor_job(
+                    _get_mac_with_arp_refresh, self._host
+                )
+                if mac is not None:
+                    self._gateway_id = mac.replace(':', '')
+                else:
+                    _LOGGER.warning(
+                        "Could not resolve MAC address for %s, using host as fallback",
+                        self._host,
+                    )
+                    self._gateway_id = self._host.replace('.', '')
         return self._gateway_id
 
     def get_gateway_status(self):
@@ -306,7 +405,7 @@ class UponorStateProxy:
 
         self._storage_metadata = data.get("_meta", {}) if isinstance(data.get("_meta", {}), dict) else {}
         self._storage_data = {key: value for key, value in data.items() if key != "_meta"}
-
+      
     def get_cached_thermostats(self):
         thermostats = self._storage_metadata.get("thermostats", [])
         ids = self._storage_metadata.get("ids", {})
@@ -318,6 +417,10 @@ class UponorStateProxy:
         return self._last_successful_update is not None and dt_util.now() - self._last_successful_update <= UNAVAILABLE_THRESHOLD
 
     async def _async_persist_discovery_metadata(self):
+        controllers = self.get_active_controllers()
+        if not controllers:
+            return
+            
         thermostats = self.get_active_thermostats()
         if not thermostats:
             return
@@ -325,6 +428,11 @@ class UponorStateProxy:
         # Merge with previously cached thermostats so that a transient JNAP
         # response missing one thermostat does not permanently remove it from
         # cache and cause its entity to be missing after the next HA restart.
+        cached_controllers = self._storage_metadata.get("controllers", [])
+        merged_controllers = list(dict.fromkeys(
+            controllers + [t for t in cached_controllers if t not in controllers]        
+        ))
+        
         cached_thermostats = self._storage_metadata.get("thermostats", [])
         merged_thermostats = list(dict.fromkeys(
             thermostats + [t for t in cached_thermostats if t not in thermostats]
@@ -332,8 +440,9 @@ class UponorStateProxy:
 
         new_metadata = {
             "gateway_id": self._data.get('cust_ip_device'),
+            "controllers": merged_controllers,
             "controller_names" : {
-                **self._storage_metadata.get("controllers", {}),
+                **self._storage_metadata.get("controller_names", {}),
                 **{
                     controller: controller_name
                     for controller in self.get_active_controllers()
@@ -397,15 +506,15 @@ class UponorStateProxy:
         return active
 
     def get_room_name(self, thermostat):
+        configured_name = self._config_entry.data.get(thermostat.lower())
+        if configured_name:
+            return configured_name        
         room_name = self._get_room_name_from_data(thermostat)
         if room_name is not None:
             return room_name
         cached_rooms = self._storage_metadata.get("rooms", {})
         if thermostat in cached_rooms:
             return cached_rooms[thermostat]
-        configured_name = self._config_entry.data.get(thermostat.lower())
-        if configured_name:
-            return configured_name
         return thermostat
 
     def get_thermostat_id(self, thermostat):
@@ -421,14 +530,15 @@ class UponorStateProxy:
         var = thermostat + '_thermostat_type'
         if var in self._data:
             hwid = int(self._data[var])
-            _LOGGER.debug(f"rh_control {self.has_humidity_control(thermostat)}")
-            _LOGGER.debug(f"rh_sensor {self.has_humidity_sensor(thermostat)}")
-            _LOGGER.debug(f"public device {self.is_public_device(thermostat)}")
-            _LOGGER.debug(f"has floor temp {self.has_floor_temperature(thermostat)}")
-            _LOGGER.debug(f"Sensor only {self.is_sensor_only(thermostat)}")
-            match hwid:
-                case 0: 
-                    return("T145") #Nobb for temp
+            sn = self.get_thermostat_id(thermostat)[:4]
+            prodk = sn[:3]
+            mod = sn[-1:]
+            _LOGGER.debug(f"id {hwid} s/n start {sn} rh_c {self.has_humidity_control(thermostat)} rh_s {self.has_humidity_sensor(thermostat)} pd {self.is_public_device(thermostat)} hft {self.has_floor_temperature(thermostat)} Sensor only {self.is_sensor_only(thermostat)}")
+            if prodk=="269":
+                if mod=="1":
+                    return ('T144')
+                if mod=="2":
+                    return ('T145')
 # Smartix Base Pulse                   
 #                   return("T141") #No temp adjustment/RH
 #                   return("T143") #No temp adjustment/External temp/Tamper Alarm
@@ -445,9 +555,7 @@ class UponorStateProxy:
 #                   return("T168") #Digital display/External temp/RH/TimeDate
 #                   return("T169") #Digital display/External temp/RH
 #                    return("T247")
-                case _:
-                    return hwid
-        return None
+        return hwid
 
     def get_model(self):
         return "R-208"
@@ -457,13 +565,6 @@ class UponorStateProxy:
         if var in self._data:
             return self._data[var].split('_')[0]
         return '-'
-
-    def get_model_name(self, devicename):
-        var = 'cust_SW_version_update'
-        if var in self._data:
-            return self._data[var].split('_')[0]
-        return '-'
-
 
     def get_version(self, thermostat):
         var = thermostat + '_sw_version'
@@ -566,6 +667,17 @@ class UponorStateProxy:
             eco_setback = int(self._data[var_eco_setback]) * mode
 
         return cool_setback + eco_setback
+
+    def get_local_override(self, thermostat):
+        var = thermostat + '_pub_setpoint_override'
+        return var in self._data and int(self._data[var]) != 0
+
+    async def async_local_override(self, thermostat, override):
+        var = thermostat + '_pub_setpoint_override'
+        data = "1" if override else "0"
+        await self._client.send_data({var: data})
+        self._data[var] = data
+        self._hass.async_create_task(self.call_state_update())
 
     # -------------------------------------------------------------------------
     # State

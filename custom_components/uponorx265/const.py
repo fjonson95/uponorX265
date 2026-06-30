@@ -29,5 +29,6 @@ STATUS_ERROR_CONTROLER = 'Communication failure controler'
 STATUS_ONLINE = 'Online'
 STATUS_OFFLINE = 'Offline'
 STATUS_ERROR_MAINCONTROLER_FAIL = 'Communication failure with main controler'
+PRESET_MANUAL = 'HA controlled'
 TOO_HIGH_TEMP_LIMIT = 4508
 DEFAULT_TEMP = 20

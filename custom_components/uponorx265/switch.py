@@ -1,17 +1,13 @@
 import logging
 
 from homeassistant.components.switch import SwitchEntity
-from homeassistant.core import callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
 from homeassistant.const import CONF_NAME
-from .const import (
-    SIGNAL_UPONOR_STATE_UPDATE,
-    DEVICE_MANUFACTURER
-)
-
+from .const import PRESET_MANUAL
 from .helper import (
-    get_unique_id_from_config_entry
+    get_unique_id_from_config_entry,
+    UponorGatewayEntity,
+    UponorThermostatEntity,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -26,39 +22,18 @@ async def async_setup_entry(hass, entry, async_add_entities):
     if state_proxy.is_cool_available():
         entities.append(CoolSwitch(unique_id, state_proxy, entry.data[CONF_NAME]))
 
+    for thermostat in hass.data[unique_id]["thermostats"]:
+        entities.append(LocalOverride(unique_id, state_proxy, thermostat))
+
     async_add_entities(entities)
 
 
-class AwaySwitch(SwitchEntity):
+class AwaySwitch(UponorGatewayEntity, SwitchEntity):
     def __init__(self, unique_instance_id, state_proxy, name):
-        self._state_proxy = state_proxy
-        self._name = name
-        self._unique_instance_id = unique_instance_id
-
-    @property
-    def device_info(self):
-        return {
-            "identifiers": {(self._unique_instance_id, self._state_proxy.get_gateway_id())},
-            "name": self._name,
-            "manufacturer": DEVICE_MANUFACTURER,
-            "model": self._state_proxy.get_model(),
-        }
-
-    @property
-    def name(self) -> str:
-        return self._name + " Away"
-
-    @property
-    def icon(self):
-        return "mdi:home-export-outline"
-
-    @property
-    def should_poll(self):
-        return False
-
-    @property
-    def available(self):
-        return self._state_proxy.is_available()
+        super().__init__(unique_instance_id, state_proxy)
+        self._attr_name = f"{name} Away"
+        self._attr_icon = "mdi:home-export-outline"
+        self._attr_unique_id = f"{unique_instance_id}_away"
 
     @property
     def is_on(self):
@@ -72,52 +47,13 @@ class AwaySwitch(SwitchEntity):
         await self._state_proxy.async_set_away(False)
         self.async_write_ha_state()
 
-    async def async_added_to_hass(self):
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass, SIGNAL_UPONOR_STATE_UPDATE, self._update_callback
-            )
-        )
 
-    @callback
-    def _update_callback(self):
-        self.async_write_ha_state()
-
-    @property
-    def unique_id(self):
-        return f"{self._unique_instance_id}_away"
-
-
-class CoolSwitch(SwitchEntity):
+class CoolSwitch(UponorGatewayEntity, SwitchEntity):
     def __init__(self, unique_instance_id, state_proxy, name):
-        self._state_proxy = state_proxy
-        self._name = name
-        self._unique_instance_id = unique_instance_id
-
-    @property
-    def device_info(self):
-        return {
-            "identifiers": {(self._unique_instance_id,self._state_proxy.get_gateway_id())},
-            "name": self._name,
-            "manufacturer": DEVICE_MANUFACTURER,
-            "model": self._state_proxy.get_model(),
-        }
-        
-    @property
-    def name(self) -> str:
-        return self._name + " Cooling Mode"
-
-    @property
-    def icon(self):
-        return "mdi:snowflake"
-
-    @property
-    def should_poll(self):
-        return False
-
-    @property
-    def available(self):
-        return self._state_proxy.is_available()
+        super().__init__(unique_instance_id, state_proxy)
+        self._attr_name = f"{name} Cooling Mode"
+        self._attr_icon = "mdi:snowflake"
+        self._attr_unique_id = f"{unique_instance_id}_cool"
 
     @property
     def is_on(self):
@@ -131,18 +67,21 @@ class CoolSwitch(SwitchEntity):
         await self._state_proxy.async_switch_to_heating()
         self.async_write_ha_state()
 
-    async def async_added_to_hass(self):
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass, SIGNAL_UPONOR_STATE_UPDATE, self._update_callback
-            )
-        )
 
-    @callback
-    def _update_callback(self):
-        self.async_write_ha_state()
+class LocalOverride(UponorThermostatEntity, SwitchEntity):
+    def __init__(self, unique_instance_id, state_proxy, thermostat):
+        super().__init__(unique_instance_id, state_proxy, thermostat)
+        self._attr_name = f"{self._room_name} {PRESET_MANUAL}"
+        self._attr_unique_id = f"{unique_instance_id}_{state_proxy.get_thermostat_id(thermostat)}_local_override"
 
     @property
-    def unique_id(self):
-        return f"{self._unique_instance_id}_cool"
+    def is_on(self):
+        return self._state_proxy.get_local_override(self._thermostat)
 
+    async def async_turn_on(self, **kwargs):
+        await self._state_proxy.async_local_override(self._thermostat, True)
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs):
+        await self._state_proxy.async_local_override(self._thermostat, False)
+        self.async_write_ha_state()

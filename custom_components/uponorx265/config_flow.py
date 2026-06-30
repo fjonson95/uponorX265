@@ -61,28 +61,47 @@ class DomainConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     data_schema=self.schema,
                     errors={"base": "invalid_host", "debug": repr(e)},
                 )
-
             self._entry_data = user_input
             return self.async_show_form(
-                step_id="rooms",
-                data_schema=self.get_rooms_schema(),
+                step_id="controllers",
+                data_schema=self.get_controllers_schema(),
             )
 
         return self.async_show_form(step_id="user", data_schema=self.schema)
 
+    async def async_step_controllers(self, user_input=None):
+        """Handle controller naming step."""
+        if user_input is None:
+            return self.async_show_form(
+                step_id="controllers",
+                data_schema=self.get_controllers_schema(),
+            )
+        self._entry_data = {**self._entry_data, **user_input}
+        return self.async_show_form(
+            step_id="rooms",
+            data_schema=self.get_rooms_schema(),
+        )
+
     async def async_step_rooms(self, user_input=None):
-        """Handle 2nd step."""
+        """Handle 3rd step."""
         if user_input is None:
             return self.async_show_form(
                 step_id="rooms",
                 data_schema=self.get_rooms_schema(),
             )
         data = {**self._entry_data, **user_input}
-
+        _LOGGER.debug(f"in {user_input} {data}")
         return self.async_create_entry(
-            title="Uponorx265",
+            #title="Uponorx265",
+            title=data['name'],
             data=data
         )
+
+    def get_controllers_schema(self):
+        controllers_schema = {}
+        for c in self.get_active_controllers():
+            controllers_schema[vol.Optional(c.lower(), default=self.get_controller_name(c))] = str
+        return vol.Schema(controllers_schema)
 
     def get_rooms_schema(self):
         rooms_schema = {}
@@ -90,17 +109,30 @@ class DomainConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             rooms_schema[vol.Optional(t.lower(), default=self.get_room_name(t))] = str
         return vol.Schema(rooms_schema)
 
+    def get_active_controllers(self):
+        active = []
+        for c in range(1, 5):
+            var = 'sys_controller_' + str(c) + '_presence'
+            if var in self._api_response and self._api_response[var] == "1":
+                active.append('C' + str(c))
+        return active
+
     def get_active_thermostats(self):
         active = []
         for c in range(1, 5):
             var = 'sys_controller_' + str(c) + '_presence'
-            if var in self._api_response and self._api_response[var] != "1":
-                continue
-            for i in range(1, 13):
-                var = 'C' + str(c) + '_thermostat_' + str(i) + '_presence'
-                if var in self._api_response and self._api_response[var] == "1":
-                    active.append('C' + str(c) + '_T' + str(i))
+            if var in self._api_response and self._api_response[var] == "1":
+                for i in range(1, 13):
+                    var = 'C' + str(c) + '_thermostat_' + str(i) + '_presence'
+                    if var in self._api_response and self._api_response[var] == "1":
+                        active.append('C' + str(c) + '_T' + str(i))
         return active
+
+    def get_controller_name(self, controller):
+        var = 'cust_' + controller.replace('C', 'Controller') + '_Name'
+        if var in self._api_response:
+            return self._api_response[var]
+        return controller
 
     def get_room_name(self, thermostat):
         var = 'cust_' + thermostat + '_name'
@@ -121,15 +153,17 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         super().__init__()
 
     async def async_step_init(self, user_input=None):
+        _LOGGER.debug(f"in {user_input} ")
         return await self.async_step_user(user_input)
 
     async def async_step_user(self, user_input=None):
         current_data = self.config_entry.data
-
+        _LOGGER.debug(f"in {user_input} {self.config_entry.data}")
         if user_input is not None:
             data = {**current_data, CONF_HOST: user_input[CONF_HOST]}
             return self.async_create_entry(
-                title="Uponorx265",
+#                title="Uponorx265",
+                title=current_data['name'],
                 data=data
             )
 
