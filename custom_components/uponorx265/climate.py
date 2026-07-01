@@ -2,6 +2,7 @@ import logging
 
 from homeassistant.components.climate import ClimateEntity
 from homeassistant.core import callback
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
 from homeassistant.const import (
@@ -44,13 +45,13 @@ async def async_setup_entry(hass, entry, async_add_entities):
 class UponorClimate(UponorThermostatEntity, ClimateEntity):
     _enable_turn_on_off_backwards_compatibility = False
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_preset_modes = [PRESET_COMFORT, PRESET_ECO, PRESET_AWAY, PRESET_MANUAL]
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE
         | ClimateEntityFeature.PRESET_MODE
         | ClimateEntityFeature.TURN_OFF
         | ClimateEntityFeature.TURN_ON
     )
-    _attr_preset_modes = [PRESET_COMFORT, PRESET_ECO, PRESET_AWAY, PRESET_MANUAL]
 
     def __init__(self, unique_instance_id, state_proxy, thermostat, name):
         super().__init__(unique_instance_id, state_proxy, thermostat)
@@ -80,6 +81,7 @@ class UponorClimate(UponorThermostatEntity, ClimateEntity):
     @property
     def hvac_modes(self):
         return [HVACMode.COOL, HVACMode.OFF] if self._state_proxy.is_cool_enabled() else [HVACMode.HEAT, HVACMode.OFF]
+
     @property
     def current_humidity(self):
         humidity = self._state_proxy.get_humidity(self._thermostat)
@@ -103,15 +105,12 @@ class UponorClimate(UponorThermostatEntity, ClimateEntity):
 
     @property
     def extra_state_attributes(self):
-        attrs = {
+        return {
             'id': self._thermostat,
             'status': self._state_proxy.get_status(self._thermostat),
             'pulse_width_modulation': self._state_proxy.get_pwm(self._thermostat),
             'eco_setback': self._state_proxy.get_eco_setback(self._thermostat),
         }
-        if not self._state_proxy.get_local_override(self._thermostat):
-            attrs['temperature_control'] = 'read_only - activate HA controlled preset to change'
-        return attrs
     
     @property
     def preset_mode(self):
@@ -173,7 +172,11 @@ class UponorClimate(UponorThermostatEntity, ClimateEntity):
 
     async def async_set_temperature(self, **kwargs):
         if not self._state_proxy.get_local_override(self._thermostat):
-            return  # Silent block
+            self.hass.async_create_task(self._state_proxy.async_update())
+            raise ServiceValidationError(
+                f"{self._room_name}: temperature is controlled by the physical thermostat dial. "
+                "Switch to 'HA controlled' preset to set temperature from Home Assistant."
+            )
         temp = kwargs.get(ATTR_TEMPERATURE)
         if temp is not None and self._is_on:
             await self._state_proxy.async_set_setpoint(self._thermostat, temp)

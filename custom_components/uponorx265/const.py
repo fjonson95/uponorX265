@@ -30,5 +30,9 @@ STATUS_ONLINE = 'Online'
 STATUS_OFFLINE = 'Offline'
 STATUS_ERROR_MAINCONTROLER_FAIL = 'Communication failure with main controler'
 PRESET_MANUAL = 'HA controlled'
+
+CONF_CREATE_CONTROLLERS = "create_controllers"
+CONF_SENSOR_TEMP = "sensor_temperature"
+CONF_BINARY_SENSOR_VALVE = "binary_sensor_valve"
 TOO_HIGH_TEMP_LIMIT = 4508
 DEFAULT_TEMP = 20

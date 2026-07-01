@@ -4,7 +4,7 @@ from homeassistant.components.sensor import SensorEntity, SensorDeviceClass, Sen
 from homeassistant.const import UnitOfTemperature, PERCENTAGE
 from homeassistant.helpers.entity import EntityCategory
 
-from .const import STATUS_OK
+from .const import STATUS_OK, CONF_CREATE_CONTROLLERS, CONF_SENSOR_TEMP
 from .helper import get_unique_id_from_config_entry, UponorGatewayEntity, UponorThermostatEntity, UponorControllerEntity
 
 _LOGGER = logging.getLogger(__name__)
@@ -19,21 +19,23 @@ async def async_setup_entry(hass, entry, async_add_entities):
     # Gateway diagnostic sensor (one per integration)
     entities.append(UponorGatewayStatusSensor(unique_id, state_proxy))
 
+    create_controllers = entry.data.get(CONF_CREATE_CONTROLLERS, True)
+    create_temp_sensor = entry.data.get(CONF_SENSOR_TEMP, True)
+
     seen_controllers = set()
     for thermostat in hass.data[unique_id]["thermostats"]:
         controller = thermostat.split('_')[0]
         if controller not in seen_controllers:
             seen_controllers.add(controller)
-        
-            entities.append(UponorRoomAvg(unique_id, state_proxy, controller))
-            # Controller diagnostic sensor (one per controller)
-            entities.append(UponorControllerStatusSensor(unique_id, state_proxy, controller))
+            if create_controllers:
+                entities.append(UponorRoomAvg(unique_id, state_proxy, controller))
+                entities.append(UponorControllerStatusSensor(unique_id, state_proxy, controller))
 
     for thermostat in hass.data[unique_id]["thermostats"]:
         room_name = state_proxy.get_room_name(thermostat)
         _LOGGER.debug(f"Adding sensors for {room_name} (thermostat ID: {thermostat})")
-        entities.append(UponorRoomCurrentTemperatureSensor(unique_id, state_proxy, thermostat))
-        # Thermostat diagnostic status sensor
+        if create_temp_sensor:
+            entities.append(UponorRoomCurrentTemperatureSensor(unique_id, state_proxy, thermostat))
         entities.append(UponorThermostatStatusSensor(unique_id, state_proxy, thermostat))
 
         if state_proxy.has_floor_temperature(thermostat):

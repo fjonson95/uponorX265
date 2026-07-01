@@ -57,7 +57,7 @@ from homeassistant.components.climate.const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = [Platform.CLIMATE, Platform.SWITCH, Platform.SENSOR]
+PLATFORMS = [Platform.CLIMATE, Platform.SWITCH, Platform.SENSOR, Platform.BINARY_SENSOR]
 
 SET_VARIABLE_SCHEMA = vol.Schema(
     {
@@ -533,12 +533,13 @@ class UponorStateProxy:
             sn = self.get_thermostat_id(thermostat)[:4]
             prodk = sn[:3]
             mod = sn[-1:]
-            _LOGGER.debug(f"id {hwid} s/n start {sn} rh_c {self.has_humidity_control(thermostat)} rh_s {self.has_humidity_sensor(thermostat)} pd {self.is_public_device(thermostat)} hft {self.has_floor_temperature(thermostat)} Sensor only {self.is_sensor_only(thermostat)}")
+      
             if prodk=="269":
                 if mod=="1":
                     return ('T144')
                 if mod=="2":
                     return ('T145')
+            _LOGGER.debug(f"id {hwid} s/n start {sn} rh_c {self.has_humidity_control(thermostat)} rh_s {self.has_humidity_sensor(thermostat)} pd {self.is_public_device(thermostat)} hft {self.has_floor_temperature(thermostat)} Sensor only {self.is_sensor_only(thermostat)}")
 # Smartix Base Pulse                   
 #                   return("T141") #No temp adjustment/RH
 #                   return("T143") #No temp adjustment/External temp/Tamper Alarm
@@ -677,7 +678,12 @@ class UponorStateProxy:
         data = "1" if override else "0"
         await self._client.send_data({var: data})
         self._data[var] = data
-        self._hass.async_create_task(self.call_state_update())
+        if not override:
+            # Re-poll immediately so HA displays the setpoint the physical dial has set,
+            # rather than the last HA-set value.
+            self._hass.async_create_task(self.async_update())
+        else:
+            self._hass.async_create_task(self.call_state_update())
 
     # -------------------------------------------------------------------------
     # State
