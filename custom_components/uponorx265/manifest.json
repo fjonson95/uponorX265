@@ -2,6 +2,9 @@
   "domain": "uponorx265",
   "name": "Uponorx265",
   "codeowners": [
+    "@asev",
+    "@dave-code-ruiz",
+    "@SmartuserHA",    
     "@fjonson95"
   ],
   "config_flow": true,
