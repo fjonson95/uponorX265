@@ -136,6 +136,8 @@ The suite is weighted towards regression coverage for bugs found during review r
 | [test_gateway_device_migration.py](tests/test_gateway_device_migration.py) | The gateway device migration finds the old device structurally, including after host-id drift |
 | [test_bypass_max_two.py](tests/test_bypass_max_two.py) | The max-2-bypass-zones-per-controller business rule, and that it's per-controller not global |
 | [test_thermostat_model_detection.py](tests/test_thermostat_model_detection.py) | The `hwid`/serial-prefix model detection heuristic and its cache fallback |
+| [test_installer_mode_entity_cleanup.py](tests/test_installer_mode_entity_cleanup.py) | Toggling `installer_settings` removes the read-only/writable twin it replaces, scoped to its own config entry |
+| [test_installer_mode_setup_flow.py](tests/test_installer_mode_setup_flow.py) | The same, end to end through real platform setup — the restore pass depends on `async_forward_entry_setups()` having registered the replacement by the time it returns |
 
 Note on the storage-race test specifically: `pytest-homeassistant-custom-component`'s mocked `Store.async_save` never actually suspends (no executor read, no disk write), so without an explicit forced yield point (`asyncio.sleep(0)` injected into the mock) the test can pass "by accident" on platforms/schedulers where the mocked coroutines happen to run to completion sequentially anyway — masking a regression instead of catching it. The injected yield point makes the test deterministic regardless of platform.
 
@@ -147,7 +149,7 @@ Windows-specific: `tests/conftest.py` neutralises `pytest_socket.disable_socket(
 
 **Two-tier feature model**, driven by flags in the config entry:
 - `controller_io` → creates relay/IO sensors per controller (pump relay, boiler demand)
-- `installer_settings` ("Installer mode") → makes relay configuration, bypass, and pump management **writable** (select/switch); otherwise the same data is shown as **read-only sensors**. The same `unique_id` format is shared between the writable/read-only version so history is preserved when toggling.
+- `installer_settings` ("Installer mode") → makes relay configuration, bypass, and pump management **writable** (select/switch); otherwise the same data is shown as **read-only sensors**. Both forms share one `unique_id`, but the entity registry is keyed by `(domain, platform, unique_id)` — so the domain change makes them two separate rows, and recorder history cannot follow across the toggle (an `entity_id` cannot change domain). Two passes keep the toggle clean: `_remove_stale_installer_mode_entities` runs before platform setup and deletes the side the current flag no longer creates, capturing the user-owned registry fields off it (name, icon, area, labels, aliases, hidden, and the `object_id`); `_restore_installer_mode_customizations` runs after `async_forward_entry_setups()` and re-applies them to the row that replaced it. So a renamed `binary_sensor.kitchen_bypass` becomes `switch.kitchen_bypass` instead of leaving an unavailable entity behind and coming back as `..._2`.
 
 **Business rules built into the entities:**
 - Max 2 active bypass zones per controller (enforced in `BypassEnableSwitch.async_turn_on`, raises `HomeAssistantError` otherwise)

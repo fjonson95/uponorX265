@@ -51,7 +51,8 @@ from .const import (
     CONTROLLER_HARDWARE_SERIES,
     SERIES_CONTROLLER_MODELS,
     SERIES_WAVE,
-    THERMOSTAT_MODELS
+    THERMOSTAT_MODELS,
+    CONF_INSTALLER_SETTINGS,
 )
 from .jnap import UponorJnap
 from .helper import (
@@ -434,6 +435,150 @@ def _remove_unsupported_local_override_entities(hass: HomeAssistant, config_entr
             ent_reg.async_remove(entry.entity_id)
 
 
+# The three features installer mode makes writable. Each pair shares one
+# unique_id between its read-only and writable form, but the entity registry
+# is keyed by (domain, platform, unique_id) - so the domain change makes them
+# two independent rows rather than one renamed entity.
+#
+# (unique_id suffix, domain when installer mode is off, domain when it is on)
+INSTALLER_MODE_ENTITY_PAIRS = (
+    ("_relay_config", "sensor", "select"),
+    ("_pump_management", "sensor", "select"),
+    ("_bypass_enable", "binary_sensor", "switch"),
+)
+
+# Registry fields that belong to the user rather than to the integration, and
+# so should follow a feature across an installer mode toggle.
+#
+# device_class and unit_of_measurement are deliberately absent: those
+# overrides are typed against the domain they were set on, and a
+# BinarySensorDeviceClass means nothing to a switch. disabled_by is absent for
+# a different reason - writing it schedules a config entry reload, and this
+# runs inside setup.
+CARRIED_REGISTRY_FIELDS = (
+    "aliases",
+    "area_id",
+    "categories",
+    "hidden_by",
+    "icon",
+    "labels",
+    "name",
+)
+
+
+def _remove_stale_installer_mode_entities(hass: HomeAssistant, config_entry: ConfigEntry) -> dict:
+    """Drop the entities stranded by a change to the installer mode flag.
+
+    Toggling `installer_settings` swaps relay config and pump management
+    between `sensor` and `select`, and bypass between `binary_sensor` and
+    `switch`. Only the side matching the current flag is ever created again,
+    so the other side lingers in the registry as an unavailable entity that
+    nothing will write to - and it keeps holding its entity_id, which is why
+    the replacement comes back as `..._2` after toggling twice.
+
+    The stale row's *state* is not salvageable - an entity_id cannot move
+    between domains, so recorder history cannot follow the flag - but
+    everything the user put on it can be. Its customizations are returned
+    keyed by the row that replaces it, for
+    `_restore_installer_mode_customizations()` to apply once platform setup
+    has created that row.
+
+    Runs on every setup rather than only on a change, so entries that were
+    toggled by an earlier version get cleaned up on their next restart.
+    """
+    installer_settings = config_entry.data.get(CONF_INSTALLER_SETTINGS, False)
+    # suffix -> (domain the current flag creates, domain it leaves behind)
+    domains = {
+        suffix: (writable, read_only) if installer_settings else (read_only, writable)
+        for suffix, read_only, writable in INSTALLER_MODE_ENTITY_PAIRS
+    }
+
+    ent_reg = entity_registry.async_get(hass)
+    carried = {}
+    for entry in entity_registry.async_entries_for_config_entry(ent_reg, config_entry.entry_id):
+        for suffix, (live_domain, stale_domain) in domains.items():
+            if entry.domain != stale_domain or not entry.unique_id.endswith(suffix):
+                continue
+
+            # Only worth rescuing when the replacement does not exist yet. If
+            # it does - an entry toggled back and forth by a version without
+            # this cleanup - it is the row the user has been living with, and
+            # its own customizations outrank the stale twin's.
+            if ent_reg.async_get_entity_id(live_domain, DOMAIN, entry.unique_id) is None:
+                carried[(live_domain, entry.unique_id)] = {
+                    "object_id": entry.entity_id.split(".", 1)[1],
+                    **{field: getattr(entry, field) for field in CARRIED_REGISTRY_FIELDS},
+                }
+
+            _LOGGER.info(
+                "Removing %s stranded by installer mode (installer_settings=%s); "
+                "the same data is now exposed by the %s entity",
+                entry.entity_id,
+                installer_settings,
+                live_domain,
+            )
+            ent_reg.async_remove(entry.entity_id)
+            break
+
+    return carried
+
+
+def _restore_installer_mode_customizations(hass: HomeAssistant, carried: dict) -> None:
+    """Put the user's customizations back on the entities that replaced them.
+
+    Must run after `async_forward_entry_setups()`: the replacement rows do not
+    exist until their platform registers them. The stale twin was removed
+    before platform setup, so its object_id is free for the replacement to
+    take - which is what turns a renamed `binary_sensor.kitchen_bypass` into
+    `switch.kitchen_bypass` rather than `switch.uponor_bypass_kitchen`.
+
+    Only non-empty values are applied, so a field the user never set on the
+    old row never clears one the platform just supplied.
+    """
+    if not carried:
+        return
+
+    ent_reg = entity_registry.async_get(hass)
+    for (domain, unique_id), customizations in carried.items():
+        entity_id = ent_reg.async_get_entity_id(domain, DOMAIN, unique_id)
+        if entity_id is None:
+            # The flag says this side should exist, but the platform did not
+            # create it: a controller or thermostat that is no longer present,
+            # or a gateway that answered with less than it used to.
+            _LOGGER.debug(
+                "Nothing replaced the removed %s entity for '%s'; "
+                "its customizations are not restored",
+                domain, unique_id,
+            )
+            continue
+
+        updates = {
+            field: customizations[field]
+            for field in CARRIED_REGISTRY_FIELDS
+            if customizations[field]
+        }
+
+        wanted_entity_id = f"{domain}.{customizations['object_id']}"
+        if wanted_entity_id != entity_id and not ent_reg.async_is_registered(wanted_entity_id):
+            updates["new_entity_id"] = wanted_entity_id
+
+        if not updates:
+            continue
+
+        try:
+            ent_reg.async_update_entity(entity_id, **updates)
+        except (ValueError, KeyError) as exc:
+            _LOGGER.warning(
+                "Could not carry the customizations of the removed entity onto %s: %s",
+                entity_id, exc,
+            )
+        else:
+            _LOGGER.info(
+                "Carried the customizations of the removed twin onto %s (now %s)",
+                entity_id, updates.get("new_entity_id", entity_id),
+            )
+
+
 def _sync_entry_config(hass: HomeAssistant, config_entry: ConfigEntry) -> None:
     """Reconcile entry.data with entry.options, filling in feature defaults."""
     # The options flow reads entry.data and writes entry.options, while every
@@ -534,6 +679,11 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
     # to the new unique_ids instead of creating duplicate entities.
     _migrate_entity_unique_ids(hass, config_entry, unique_id)
 
+    # Same reason - must run before platform setup, so the registry no longer
+    # holds the stranded read-only/writable twin when the platforms register
+    # the side the current installer_settings value asks for.
+    carried_customizations = _remove_stale_installer_mode_entities(hass, config_entry)
+
     # Register gateway/controller devices before platform setup: CLIMATE and
     # SWITCH load before SENSOR, and their entities' via_device would
     # otherwise reference a controller device that doesn't exist yet.
@@ -541,6 +691,10 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
 
     # Forward setup for "climate" and "switch" platforms (done outside of the event loop)
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+
+    # The replacement entities exist now, so what was rescued from the twins
+    # removed above can be put back on them.
+    _restore_installer_mode_customizations(hass, carried_customizations)
 
     # Track time interval for updates (use async function)
     cancel_interval = async_track_time_interval(hass, state_proxy.async_update, SCAN_INTERVAL)
