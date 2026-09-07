@@ -1,6 +1,8 @@
+import inspect
 import logging
 from homeassistant.helpers.entity import Entity
 from homeassistant.core import callback
+from homeassistant.helpers import device_registry
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
 from .const import (
@@ -55,6 +57,94 @@ def _async_get_devices_by_connection(dev_reg, connection: tuple[str, str]):
     return [device] if device is not None else []
 
 
+def _async_get_device_by_identifier(
+    dev_reg: device_registry.DeviceRegistry,
+    identifier: tuple[str, str],
+    config_entry_id: str,
+) -> device_registry.DeviceEntry | None:
+    """Look up a device by a single identifier, scoped to one config entry.
+
+    `async_get_device_by_identifier` was added in HA 2026.8, replacing
+    `async_get_device` — identifiers are no longer unique across config
+    entries, so the unscoped lookup is deprecated and breaks in HA 2027.8.
+
+    On cores older than 2026.8 the new method doesn't exist and the
+    deprecated one is the only lookup available. Falling back to it is safe
+    there: identifiers *were* still unique across entries on those versions,
+    and this integration's identifiers are namespaced by the per-entry
+    unique_instance_id anyway, so both calls resolve the same device.
+
+    Drop this shim (and call the registry directly) once the integration
+    requires 2026.8 or newer.
+    """
+    if hasattr(dev_reg, "async_get_device_by_identifier"):
+        return dev_reg.async_get_device_by_identifier(identifier, config_entry_id)
+    return dev_reg.async_get_device(identifiers={identifier})
+
+
+# `via_device` (the parent's identifier tuple) was deprecated in HA 2026.9 in
+# favour of `via_device_id` (the parent's registry id), which landed in 2026.8.
+# Checking the signature keeps this tied to the parameter actually being asked
+# about, rather than to a version number. Drop the fallback — and pass
+# via_device_id directly — once the integration requires 2026.8 or newer.
+_SUPPORTS_VIA_DEVICE_ID = "via_device_id" in inspect.signature(
+    device_registry.DeviceRegistry.async_get_or_create
+).parameters
+
+
+def _via_device_kwargs(
+    parent: device_registry.DeviceEntry, parent_identifier: tuple[str, str]
+) -> dict:
+    """Return the async_get_or_create kwarg that links a child to its parent."""
+    if _SUPPORTS_VIA_DEVICE_ID:
+        return {"via_device_id": parent.id}
+    return {"via_device": parent_identifier}
+
+
+def _entity_config_entry_id(entity: Entity) -> str | None:
+    """The config entry id an entity is being added under, if known.
+
+    `device_info` is read by the entity platform after `add_to_platform_start`
+    has attached both hass and the platform, so this resolves for every real
+    add; it returns None when a property is read off a bare, unattached
+    entity.
+    """
+    config_entry = getattr(entity.platform, "config_entry", None)
+    return config_entry.entry_id if config_entry is not None else None
+
+
+def _via_device_info(entity: Entity, parent_identifier: tuple[str, str]) -> dict:
+    """Return the `device_info` key linking an entity's device to its parent.
+
+    The entity platform forwards `device_info` key-for-key to
+    `async_get_or_create`, so a `via_device` here earns the same deprecation
+    warning as a direct call would — reported against the platform's
+    `async_add_entities` line rather than this module. The replacement key
+    wants the parent's registry id, so the parent has to be looked up;
+    `_register_gateway_devices` puts the gateway and controller devices in the
+    registry before platform setup precisely so that lookup resolves.
+
+    An unresolvable parent yields no key at all rather than a fallback to the
+    deprecated one. `via_device_id` naming no device raises `DeviceInfoError`,
+    which makes the entity platform drop the entity outright, while the old
+    `via_device` only logged and left the link unset — so an unlinked device
+    is the closer match to the previous behaviour, and much the lesser
+    failure.
+    """
+    if not _SUPPORTS_VIA_DEVICE_ID:
+        return {"via_device": parent_identifier}
+    hass = entity.hass
+    config_entry_id = _entity_config_entry_id(entity)
+    if hass is None or config_entry_id is None:
+        return {}
+    parent = _async_get_device_by_identifier(
+        device_registry.async_get(hass), parent_identifier, config_entry_id
+    )
+    if parent is None:
+        return {}
+    return {"via_device_id": parent.id}
+
+
 def get_unique_id_from_config_entry(config_entry: ConfigEntry):
     return config_entry.unique_id
 
@@ -80,7 +170,10 @@ class UponorThermostatEntity(Entity):
             "model": self._state_proxy.get_thermostat_model(self._thermostat),
             "sw_version": self._state_proxy.get_version(self._thermostat),
             "serial_number": self._state_proxy.get_thermostat_id(self._thermostat),
-            "via_device": (self._unique_instance_id, self._state_proxy.get_controller_id(self._controller)),
+            **_via_device_info(
+                self,
+                (self._unique_instance_id, self._state_proxy.get_controller_id(self._controller)),
+            ),
         }
 
     @property
@@ -122,7 +215,10 @@ class UponorControllerEntity(Entity):
             "model": self._state_proxy.get_controller_hardware(self._controller),
             "sw_version": self._state_proxy.get_controller_version(self._controller),
             "serial_number": self._state_proxy.get_controller_id(self._controller),
-            "via_device": (self._unique_instance_id, self._state_proxy.get_gateway_id()),
+            **_via_device_info(
+                self,
+                (self._unique_instance_id, self._state_proxy.get_gateway_id()),
+            ),
         }
 
     @property

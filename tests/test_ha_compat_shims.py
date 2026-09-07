@@ -28,13 +28,12 @@ import pytest
 from homeassistant.helpers import device_registry as dr
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-import custom_components.uponorx265 as uponor
-from custom_components.uponorx265 import (
-    DOMAIN,
+import custom_components.uponorx265.helper as uponor_helper
+from custom_components.uponorx265 import DOMAIN, _register_gateway_devices
+from custom_components.uponorx265.helper import (
     _async_get_device_by_identifier,
-    _register_gateway_devices,
+    _async_get_devices_by_connection,
 )
-from custom_components.uponorx265.helper import _async_get_devices_by_connection
 from tests.helpers import make_state_proxy
 
 UNIQUE_ID = "uponorx265_test"
@@ -98,7 +97,7 @@ async def test_lookup_falls_back_to_async_get_device(hass, monkeypatch):
 
 async def test_via_device_fallback_still_builds_the_hierarchy(hass, monkeypatch):
     """With via_device_id unavailable, via_device must still parent the controller."""
-    monkeypatch.setattr(uponor, "_SUPPORTS_VIA_DEVICE_ID", False)
+    monkeypatch.setattr(uponor_helper, "_SUPPORTS_VIA_DEVICE_ID", False)
 
     proxy = make_state_proxy(
         hass,

@@ -46,7 +46,7 @@ limit is ever exercised.
 It was pinned to `0.13.357` (HA 2026.8.3) while the integration still called
 `device_registry.async_get_device`, which HA 2026.9 promotes from a deprecation
 warning to a hard `RuntimeError`. Those calls now go through the compat shims in
-[`__init__.py`](../custom_components/uponorx265/__init__.py), so the suite is
+[`helper.py`](../custom_components/uponorx265/helper.py), so the suite is
 green on the 2026.9 betas and the pin is gone.
 
 ### The one thing to watch

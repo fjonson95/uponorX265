@@ -76,9 +76,11 @@ The entry's `unique_id` is derived from the user's chosen name, not the MAC, so 
 Limits worth knowing: recovery waits for the next lease renewal, and HA has to be able to observe DHCP traffic at all (fine on HAOS/Supervised, not guaranteed for containers on a bridge network). A gateway on another subnet is not seen either — though note the JNAP MAC read *does* work cross-subnet, so the device identity stays correct there even when this recovery path cannot fire. None of this was possible with the previous ARP-based lookup, which could not produce a MAC to register in exactly those situations.
 
 ### Device registration ordering — [__init__.py](custom_components/uponorx265/__init__.py)
-Thermostat and controller entities declare a `via_device` pointing at their parent (controller, then gateway) in their `device_info`. Historically the parent device only ever got created as a side effect of a specific entity — a controller status sensor, gated behind the optional `CONF_CREATE_CONTROLLERS` — which lives in the `SENSOR` platform, loaded *after* `CLIMATE` and `SWITCH` in `PLATFORMS`. HA would log a `via_device` referencing a non-existing device warning and eventually stop honoring it, and if the controller sensor was disabled the parent device was never created at all.
+Thermostat and controller entities link their device to its parent (controller, then gateway) from their `device_info`. Historically the parent device only ever got created as a side effect of a specific entity — a controller status sensor, gated behind the optional `CONF_CREATE_CONTROLLERS` — which lives in the `SENSOR` platform, loaded *after* `CLIMATE` and `SWITCH` in `PLATFORMS`. HA would log a `via_device` referencing a non-existing device warning and eventually stop honoring it, and if the controller sensor was disabled the parent device was never created at all.
 
 `_register_gateway_devices()` fixes this by registering the gateway and controller devices explicitly in `async_setup_entry`, before `async_forward_entry_setups()` is called — so the parent always exists regardless of platform order or which optional entities are enabled. It falls back to `get_cached_controllers()` (mirroring `get_cached_thermostats()`) when live data isn't loaded yet, e.g. on a warm restart where `async_update()` runs as a background task instead of being awaited.
+
+Ordering became load-bearing rather than merely tidy when the link moved to `via_device_id`. HA 2026.9 deprecated `via_device` (the parent's *identifier tuple*, which the registry resolved for you, tolerating a miss with a log line) in favour of `via_device_id` (the parent's *registry id*), so `device_info` now has to resolve the parent itself — `_via_device_info()` in [helper.py](custom_components/uponorx265/helper.py). A `via_device_id` naming no registered device raises `DeviceInfoError` and the entity platform drops the entity, so an unresolved parent yields no link at all rather than a bad one: a flat device tree, never a missing entity.
 
 ### Setpoint storage & restore-on-off — [__init__.py](custom_components/uponorx265/__init__.py) / [climate.py](custom_components/uponorx265/climate.py)
 The integration has no real on/off register — "off" is encoded as `setpoint == min_temp` (or `max_temp` in cool mode). The `.storage` file's per-thermostat setpoint memo is therefore the only thing that can restore a room to its pre-off temperature, which makes its read-modify-write path load-bearing:
@@ -90,7 +92,7 @@ The integration has no real on/off register — "off" is encoded as `setpoint ==
 ### Entity base — [helper.py](custom_components/uponorx265/helper.py)
 Three base classes build a device hierarchy in HA:
 
-| Base class | Device | `via_device` |
+| Base class | Device | Parent (`via_device_id`) |
 |---|---|---|
 | `UponorGatewayEntity` | Gateway (root) | — |
 | `UponorControllerEntity` | Controller | Gateway |

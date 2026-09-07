@@ -1,5 +1,4 @@
 import asyncio
-import inspect
 import math
 import logging
 
@@ -55,7 +54,11 @@ from .const import (
     THERMOSTAT_MODELS
 )
 from .jnap import UponorJnap
-from .helper import get_unique_id_from_config_entry
+from .helper import (
+    get_unique_id_from_config_entry,
+    _async_get_device_by_identifier,
+    _via_device_kwargs,
+)
 
 from homeassistant.components.climate.const import (
     PRESET_AWAY,
@@ -241,50 +244,6 @@ def _get_registered_gateway_id(
     if not candidates:
         return None
     return min(candidates)[-1]
-
-
-# `via_device` (the parent's identifier tuple) was deprecated in HA 2026.9 in
-# favour of `via_device_id` (the parent's registry id), which landed in 2026.8.
-# Checking the signature keeps this tied to the parameter actually being asked
-# about, rather than to a version number. Drop the fallback — and pass
-# via_device_id directly — once the integration requires 2026.8 or newer.
-_SUPPORTS_VIA_DEVICE_ID = "via_device_id" in inspect.signature(
-    device_registry.DeviceRegistry.async_get_or_create
-).parameters
-
-
-def _via_device_kwargs(
-    parent: device_registry.DeviceEntry, parent_identifier: tuple[str, str]
-) -> dict:
-    """Return the async_get_or_create kwarg that links a child to its parent."""
-    if _SUPPORTS_VIA_DEVICE_ID:
-        return {"via_device_id": parent.id}
-    return {"via_device": parent_identifier}
-
-
-def _async_get_device_by_identifier(
-    dev_reg: device_registry.DeviceRegistry,
-    identifier: tuple[str, str],
-    config_entry_id: str,
-) -> device_registry.DeviceEntry | None:
-    """Look up a device by a single identifier, scoped to one config entry.
-
-    `async_get_device_by_identifier` was added in HA 2026.8, replacing
-    `async_get_device` — identifiers are no longer unique across config
-    entries, so the unscoped lookup is deprecated and breaks in HA 2027.8.
-
-    On cores older than 2026.8 the new method doesn't exist and the
-    deprecated one is the only lookup available. Falling back to it is safe
-    there: identifiers *were* still unique across entries on those versions,
-    and this integration's identifiers are namespaced by the per-entry
-    unique_instance_id anyway, so both calls resolve the same device.
-
-    Drop this shim (and call the registry directly) once the integration
-    requires 2026.8 or newer.
-    """
-    if hasattr(dev_reg, "async_get_device_by_identifier"):
-        return dev_reg.async_get_device_by_identifier(identifier, config_entry_id)
-    return dev_reg.async_get_device(identifiers={identifier})
 
 
 def _migrate_gateway_device_id(hass: HomeAssistant, config_entry: ConfigEntry, unique_instance_id: str, new_gateway_id: str) -> None:
