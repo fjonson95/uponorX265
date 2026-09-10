@@ -16,7 +16,6 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers import device_registry, entity_registry
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from getmac import get_mac_address
 
 import homeassistant.util.dt as dt_util
 
@@ -46,10 +45,21 @@ from .const import (
     TOO_HIGH_TEMP_LIMIT,
     DEFAULT_TEMP,
     DEVICE_MANUFACTURER,
-    DIAL_THERMOSTAT_MODELS
+    DIAL_THERMOSTAT_MODELS,
+    FLAG_DEFAULTS,
+    CONTROLLER_FIRMWARE_SERIES,
+    CONTROLLER_HARDWARE_SERIES,
+    SERIES_CONTROLLER_MODELS,
+    SERIES_WAVE,
+    THERMOSTAT_MODELS,
+    CONF_INSTALLER_SETTINGS,
 )
 from .jnap import UponorJnap
-from .helper import get_unique_id_from_config_entry, _get_mac_with_arp_refresh 
+from .helper import (
+    get_unique_id_from_config_entry,
+    _async_get_device_by_identifier,
+    _via_device_kwargs,
+)
 
 from homeassistant.components.climate.const import (
     PRESET_AWAY,
@@ -60,6 +70,10 @@ from homeassistant.components.climate.const import (
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.CLIMATE, Platform.SWITCH, Platform.SENSOR, Platform.BINARY_SENSOR, Platform.SELECT]
+
+# Registered once for the domain rather than per config entry, so they have to
+# be removed once the last entry goes - see async_unload_entry.
+DOMAIN_SERVICES = ("set_variable", "dump_hardware_info", "dump_raw_data")
 
 SET_VARIABLE_SCHEMA = vol.Schema(
     {
@@ -115,14 +129,24 @@ def _resolve_target_proxies(hass: HomeAssistant, call) -> list:
 def _migrate_entity_unique_ids(hass: HomeAssistant, config_entry: ConfigEntry, unique_instance_id: str) -> None:
     """Migrate entity registry entries to the current unique_id formats.
 
-    Two historical format changes are handled, composing so that an upgrade
+    Three historical format changes are handled, composing so that an upgrade
     from any older version lands on the current format in one pass:
     - pre-1.1.2: bare ids (no config-entry prefix) gain the prefix
     - pre-1.1.5: climate ids (no '_climate' suffix) gain the suffix
+    - the gateway status sensor drops the embedded gateway id
     """
     ent_reg = entity_registry.async_get(hass)
     entries = entity_registry.async_entries_for_config_entry(ent_reg, config_entry.entry_id)
     prefix = f"{unique_instance_id}_"
+
+    def _entity_preference_key(entry):
+        """Prefer the oldest row, then an entity id without a numeric suffix."""
+        _, separator, suffix = entry.entity_id.rpartition("_")
+        return (
+            entry.created_at,
+            bool(separator and suffix.isdigit()),
+            entry.entity_id,
+        )
 
     for entry in entries:
         new_unique_id = entry.unique_id
@@ -130,15 +154,52 @@ def _migrate_entity_unique_ids(hass: HomeAssistant, config_entry: ConfigEntry, u
             new_unique_id = f"{prefix}{new_unique_id}"
         if entry.domain == "climate" and not new_unique_id.endswith("_climate"):
             new_unique_id = f"{new_unique_id}_climate"
+        # The gateway status sensor used to embed the resolved gateway id
+        # (MAC when resolvable, the host with dots stripped when not). That id
+        # changes the first time MAC resolution starts working, which silently
+        # changed this unique_id and left the previous entity behind holding
+        # the good entity_id - so the new one came back as
+        # sensor.uponor_gateway_status_2. Collapse every historical form to
+        # the id-free one, which cannot drift.
+        if entry.domain == "sensor" and new_unique_id.endswith("_gateway_status"):
+            new_unique_id = f"{prefix}gateway_status"
 
         if new_unique_id == entry.unique_id:
             continue
 
         # Scenario 2: an entity with the new unique_id already exists (created
-        # as a duplicate by a version that lacked this migration). Remove the
-        # stale old-id entry instead of failing.
+        # as a duplicate by a version that lacked this migration).
         existing_entity_id = ent_reg.async_get_entity_id(entry.domain, DOMAIN, new_unique_id)
         if existing_entity_id is not None:
+            existing_entry = ent_reg.async_get(existing_entity_id)
+            is_gateway_status = (
+                entry.domain == "sensor"
+                and new_unique_id == f"{prefix}gateway_status"
+                and existing_entry is not None
+                and existing_entry.config_entry_id == config_entry.entry_id
+            )
+            if is_gateway_status:
+                # Keep the original registry row, which normally owns the
+                # unsuffixed entity_id and all of the user's customizations.
+                # created_at also makes this deterministic for less common
+                # combinations of several historical gateway ids.
+                if _entity_preference_key(entry) < _entity_preference_key(existing_entry):
+                    ent_reg.async_remove(existing_entry.entity_id)
+                    ent_reg.async_update_entity(entry.entity_id, new_unique_id=new_unique_id)
+                    kept_entity_id = entry.entity_id
+                    removed_entity_id = existing_entry.entity_id
+                else:
+                    ent_reg.async_remove(entry.entity_id)
+                    kept_entity_id = existing_entry.entity_id
+                    removed_entity_id = entry.entity_id
+                _LOGGER.info(
+                    "Merged duplicate gateway status entities; kept %s and removed %s",
+                    kept_entity_id,
+                    removed_entity_id,
+                )
+                continue
+
+            # For all other migrations, retain the already-canonical row.
             _LOGGER.info(
                 "Removing stale entity %s (unique_id '%s') because '%s' already exists as %s",
                 entry.entity_id, entry.unique_id, new_unique_id, existing_entity_id,
@@ -159,6 +220,33 @@ def _migrate_entity_unique_ids(hass: HomeAssistant, config_entry: ConfigEntry, u
                 entry.entity_id, entry.unique_id, exc,
             )
 
+def _get_registered_gateway_id(
+    hass: HomeAssistant, config_entry: ConfigEntry, unique_instance_id: str
+) -> str | None:
+    """Return the best existing gateway identifier for an unconfirmed fallback."""
+    dev_reg = device_registry.async_get(hass)
+    candidates = []
+    for device in device_registry.async_entries_for_config_entry(
+        dev_reg, config_entry.entry_id
+    ):
+        if device.via_device_id is not None:
+            continue
+        for identifier_domain, identifier in device.identifiers:
+            if identifier_domain == unique_instance_id:
+                candidates.append(
+                    (
+                        device.model != "R-208",
+                        device.created_at,
+                        device.id,
+                        identifier,
+                    )
+                )
+
+    if not candidates:
+        return None
+    return min(candidates)[-1]
+
+
 def _migrate_gateway_device_id(hass: HomeAssistant, config_entry: ConfigEntry, unique_instance_id: str, new_gateway_id: str) -> None:
     """Reconcile the gateway device's identifier with a newly-resolved MAC.
 
@@ -173,15 +261,17 @@ def _migrate_gateway_device_id(hass: HomeAssistant, config_entry: ConfigEntry, u
     device with no via_device (the root of the gateway/controller/thermostat
     hierarchy) — whatever identifier it currently holds, that's the old
     gateway device to reconcile. Renames it in place if no device already
-    exists under the new identifier, or drops it (after copying over any
-    user customization) if one does.
+    exists under the new identifier, or merges it (including attached
+    entities, child devices, and user customization) if one does.
     """
     if new_gateway_id is None:
         return
 
     dev_reg = device_registry.async_get(hass)
     new_identifier = (unique_instance_id, new_gateway_id)
-    new_device = dev_reg.async_get_device(identifiers={new_identifier})
+    new_device = _async_get_device_by_identifier(
+        dev_reg, new_identifier, config_entry.entry_id
+    )
 
     old_device = next(
         (
@@ -203,12 +293,29 @@ def _migrate_gateway_device_id(hass: HomeAssistant, config_entry: ConfigEntry, u
         )
         return
 
-    # A new device already exists (created by a prior restart). Carry over
-    # any user customization, then drop the now-orphaned old device.
+    # A new device already exists (created by a prior restart). Move every
+    # reference away from the old device before removing it: Home Assistant
+    # otherwise deletes attached entity rows and clears child parent links.
     if old_device.area_id and not new_device.area_id:
         dev_reg.async_update_device(new_device.id, area_id=old_device.area_id)
     if old_device.name_by_user and not new_device.name_by_user:
         dev_reg.async_update_device(new_device.id, name_by_user=old_device.name_by_user)
+
+    ent_reg = entity_registry.async_get(hass)
+    for entity_entry in entity_registry.async_entries_for_device(
+        ent_reg, old_device.id, include_disabled_entities=True
+    ):
+        ent_reg.async_update_entity(entity_entry.entity_id, device_id=new_device.id)
+
+    for child_device in device_registry.async_entries_for_config_entry(
+        dev_reg, config_entry.entry_id
+    ):
+        if child_device.via_device_id == old_device.id:
+            dev_reg.async_update_device(
+                child_device.id,
+                via_device_id=new_device.id,
+            )
+
     dev_reg.async_remove_device(old_device.id)
     _LOGGER.info(
         "Removed orphaned gateway device (%s) for %s, superseded by '%s'",
@@ -228,13 +335,25 @@ def _register_gateway_devices(hass: HomeAssistant, config_entry: ConfigEntry, un
     are enabled.
     """
     dev_reg = device_registry.async_get(hass)
-    dev_reg.async_get_or_create(
+    gateway_identifier = (unique_instance_id, state_proxy.get_gateway_id())
+    # The MAC goes in as a connection, not just as part of the identifier
+    # string: HA matches DHCP leases against connections, which is how the
+    # entry recovers when the gateway is handed a new IP.
+    gateway_mac = state_proxy.get_gateway_mac()
+    gateway_device = dev_reg.async_get_or_create(
         config_entry_id=config_entry.entry_id,
-        identifiers={(unique_instance_id, state_proxy.get_gateway_id())},
+        identifiers={gateway_identifier},
+        connections=(
+            {(device_registry.CONNECTION_NETWORK_MAC, gateway_mac)}
+            if gateway_mac
+            else set()
+        ),
         manufacturer=DEVICE_MANUFACTURER,
         name=state_proxy.get_integration_name(),
         model=state_proxy.get_model(),
-        serial_number=state_proxy.get_gateway_id(),
+        sw_version=state_proxy.get_gateway_sw_version(),
+        hw_version=state_proxy.get_gateway_hw_version(),
+        serial_number=state_proxy.get_gateway_serial(),
     )
     controllers = state_proxy.get_active_controllers() or state_proxy.get_cached_controllers()
     for controller in controllers:
@@ -246,8 +365,57 @@ def _register_gateway_devices(hass: HomeAssistant, config_entry: ConfigEntry, un
             model=state_proxy.get_controller_hardware(controller),
             sw_version=state_proxy.get_controller_version(controller),
             serial_number=state_proxy.get_controller_id(controller),
-            via_device=(unique_instance_id, state_proxy.get_gateway_id()),
+            **_via_device_kwargs(gateway_device, gateway_identifier),
         )
+
+
+def _refresh_device_metadata(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    unique_instance_id: str,
+    state_proxy,
+    thermostats,
+) -> None:
+    """Rewrite device model and firmware once live data has actually arrived.
+
+    On a cached startup the first update is dispatched as a background task,
+    so platform setup - and every `device_info` evaluated by it - runs against
+    an empty `_data`. Values with a cached fallback survive that: the
+    thermostat model is persisted in the discovery metadata, so it resolves.
+    Everything read straight from `_data` resolves to None, and stays None for
+    the whole session, because `device_info` is only consulted when an entity
+    is added. That is what leaves the controller model and every firmware
+    version blank on the device pages while `dump_hardware_info` - which reads
+    the same getters live - reports all of them correctly.
+
+    Re-running the registration with populated data reconciles both. It is
+    done once per setup rather than on every poll: these values change only
+    when hardware is swapped or firmware is flashed, and both mean a restart.
+    """
+    _register_gateway_devices(hass, config_entry, unique_instance_id, state_proxy)
+
+    dev_reg = device_registry.async_get(hass)
+    for thermostat in thermostats:
+        identifier = (unique_instance_id, state_proxy.get_thermostat_id(thermostat))
+        device = _async_get_device_by_identifier(
+            dev_reg, identifier, config_entry.entry_id
+        )
+        if device is None:
+            continue
+
+        updates = {}
+        model = state_proxy.get_thermostat_model(thermostat)
+        if model is not None and model != device.model:
+            updates["model"] = model
+        sw_version = state_proxy.get_version(thermostat)
+        if sw_version is not None and sw_version != device.sw_version:
+            updates["sw_version"] = sw_version
+
+        if updates:
+            _LOGGER.debug(
+                "Refreshing device metadata for %s: %s", thermostat, updates
+            )
+            dev_reg.async_update_device(device.id, **updates)
 
 
 def _remove_unsupported_local_override_entities(hass: HomeAssistant, config_entry: ConfigEntry, unique_instance_id: str, state_proxy, thermostats) -> None:
@@ -267,15 +435,176 @@ def _remove_unsupported_local_override_entities(hass: HomeAssistant, config_entr
             ent_reg.async_remove(entry.entity_id)
 
 
+# The three features installer mode makes writable. Each pair shares one
+# unique_id between its read-only and writable form, but the entity registry
+# is keyed by (domain, platform, unique_id) - so the domain change makes them
+# two independent rows rather than one renamed entity.
+#
+# (unique_id suffix, domain when installer mode is off, domain when it is on)
+INSTALLER_MODE_ENTITY_PAIRS = (
+    ("_relay_config", "sensor", "select"),
+    ("_pump_management", "sensor", "select"),
+    ("_bypass_enable", "binary_sensor", "switch"),
+)
+
+# Registry fields that belong to the user rather than to the integration, and
+# so should follow a feature across an installer mode toggle.
+#
+# device_class and unit_of_measurement are deliberately absent: those
+# overrides are typed against the domain they were set on, and a
+# BinarySensorDeviceClass means nothing to a switch. disabled_by is absent for
+# a different reason - writing it schedules a config entry reload, and this
+# runs inside setup.
+CARRIED_REGISTRY_FIELDS = (
+    "aliases",
+    "area_id",
+    "categories",
+    "hidden_by",
+    "icon",
+    "labels",
+    "name",
+)
+
+
+def _remove_stale_installer_mode_entities(hass: HomeAssistant, config_entry: ConfigEntry) -> dict:
+    """Drop the entities stranded by a change to the installer mode flag.
+
+    Toggling `installer_settings` swaps relay config and pump management
+    between `sensor` and `select`, and bypass between `binary_sensor` and
+    `switch`. Only the side matching the current flag is ever created again,
+    so the other side lingers in the registry as an unavailable entity that
+    nothing will write to - and it keeps holding its entity_id, which is why
+    the replacement comes back as `..._2` after toggling twice.
+
+    The stale row's *state* is not salvageable - an entity_id cannot move
+    between domains, so recorder history cannot follow the flag - but
+    everything the user put on it can be. Its customizations are returned
+    keyed by the row that replaces it, for
+    `_restore_installer_mode_customizations()` to apply once platform setup
+    has created that row.
+
+    Runs on every setup rather than only on a change, so entries that were
+    toggled by an earlier version get cleaned up on their next restart.
+    """
+    installer_settings = config_entry.data.get(CONF_INSTALLER_SETTINGS, False)
+    # suffix -> (domain the current flag creates, domain it leaves behind)
+    domains = {
+        suffix: (writable, read_only) if installer_settings else (read_only, writable)
+        for suffix, read_only, writable in INSTALLER_MODE_ENTITY_PAIRS
+    }
+
+    ent_reg = entity_registry.async_get(hass)
+    carried = {}
+    for entry in entity_registry.async_entries_for_config_entry(ent_reg, config_entry.entry_id):
+        for suffix, (live_domain, stale_domain) in domains.items():
+            if entry.domain != stale_domain or not entry.unique_id.endswith(suffix):
+                continue
+
+            # Only worth rescuing when the replacement does not exist yet. If
+            # it does - an entry toggled back and forth by a version without
+            # this cleanup - it is the row the user has been living with, and
+            # its own customizations outrank the stale twin's.
+            if ent_reg.async_get_entity_id(live_domain, DOMAIN, entry.unique_id) is None:
+                carried[(live_domain, entry.unique_id)] = {
+                    "object_id": entry.entity_id.split(".", 1)[1],
+                    **{field: getattr(entry, field) for field in CARRIED_REGISTRY_FIELDS},
+                }
+
+            _LOGGER.info(
+                "Removing %s stranded by installer mode (installer_settings=%s); "
+                "the same data is now exposed by the %s entity",
+                entry.entity_id,
+                installer_settings,
+                live_domain,
+            )
+            ent_reg.async_remove(entry.entity_id)
+            break
+
+    return carried
+
+
+def _restore_installer_mode_customizations(hass: HomeAssistant, carried: dict) -> None:
+    """Put the user's customizations back on the entities that replaced them.
+
+    Must run after `async_forward_entry_setups()`: the replacement rows do not
+    exist until their platform registers them. The stale twin was removed
+    before platform setup, so its object_id is free for the replacement to
+    take - which is what turns a renamed `binary_sensor.kitchen_bypass` into
+    `switch.kitchen_bypass` rather than `switch.uponor_bypass_kitchen`.
+
+    Only non-empty values are applied, so a field the user never set on the
+    old row never clears one the platform just supplied.
+    """
+    if not carried:
+        return
+
+    ent_reg = entity_registry.async_get(hass)
+    for (domain, unique_id), customizations in carried.items():
+        entity_id = ent_reg.async_get_entity_id(domain, DOMAIN, unique_id)
+        if entity_id is None:
+            # The flag says this side should exist, but the platform did not
+            # create it: a controller or thermostat that is no longer present,
+            # or a gateway that answered with less than it used to.
+            _LOGGER.debug(
+                "Nothing replaced the removed %s entity for '%s'; "
+                "its customizations are not restored",
+                domain, unique_id,
+            )
+            continue
+
+        updates = {
+            field: customizations[field]
+            for field in CARRIED_REGISTRY_FIELDS
+            if customizations[field]
+        }
+
+        wanted_entity_id = f"{domain}.{customizations['object_id']}"
+        if wanted_entity_id != entity_id and not ent_reg.async_is_registered(wanted_entity_id):
+            updates["new_entity_id"] = wanted_entity_id
+
+        if not updates:
+            continue
+
+        try:
+            ent_reg.async_update_entity(entity_id, **updates)
+        except (ValueError, KeyError) as exc:
+            _LOGGER.warning(
+                "Could not carry the customizations of the removed entity onto %s: %s",
+                entity_id, exc,
+            )
+        else:
+            _LOGGER.info(
+                "Carried the customizations of the removed twin onto %s (now %s)",
+                entity_id, updates.get("new_entity_id", entity_id),
+            )
+
+
+def _sync_entry_config(hass: HomeAssistant, config_entry: ConfigEntry) -> None:
+    """Reconcile entry.data with entry.options, filling in feature defaults."""
+    # The options flow reads entry.data and writes entry.options, while every
+    # platform reads entry.data - so the two have to be kept in step or an
+    # options change never reaches the entities.
+    #
+    # Merge rather than replace: options win over data, a key only data holds
+    # survives (a wholesale replace would drop it), and any feature flag
+    # neither carries falls back to its documented default. Entries created
+    # before the 1.1.5 refactor have none of those keys, so without the
+    # defaults data and options can never compare equal and this ran on every
+    # single setup.
+    #
+    # Deliberately does NOT touch the device or entity registries. This block
+    # used to call async_clear_config_entry() on both first, which deletes
+    # every entity row belonging to the entry - taking custom names,
+    # entity_ids, areas and icons with it, and re-registering under fresh
+    # entity_ids - and it ran before both migrations, leaving them an empty
+    # device list and nothing to migrate.
+    merged = {**FLAG_DEFAULTS, **config_entry.data, **(config_entry.options or {})}
+    if merged != dict(config_entry.data) or merged != dict(config_entry.options):
+        hass.config_entries.async_update_entry(config_entry, data=merged, options=merged)
+
+
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
-    # Sync options to data if they differ
-    if config_entry.options:
-        if config_entry.data != config_entry.options:
-            dev_reg = device_registry.async_get(hass)
-            ent_reg = entity_registry.async_get(hass)
-            dev_reg.async_clear_config_entry(config_entry.entry_id)
-            ent_reg.async_clear_config_entry(config_entry.entry_id)
-            hass.config_entries.async_update_entry(config_entry, data=config_entry.options)
+    _sync_entry_config(hass, config_entry)
 
     host = config_entry.data[CONF_HOST]
     unique_id = get_unique_id_from_config_entry(config_entry)
@@ -289,16 +618,38 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
     await state_proxy.async_load_storage()
 
     thermostats = state_proxy.get_cached_thermostats()
-    if thermostats:
+    started_from_cache = bool(thermostats)
+    if started_from_cache:
         hass.async_create_task(state_proxy.async_update())
     else:
         await state_proxy.async_update()
         thermostats = state_proxy.get_active_thermostats()
 
-    # Must run before platform setup: device_info reads get_gateway_id(),
-    # which otherwise falls back to a host-based id for the entire session.
-    resolved_gateway_id = await state_proxy.async_resolve_gateway_id()
-    _migrate_gateway_device_id(hass, config_entry, unique_id, resolved_gateway_id)
+    # Resolving the gateway id is a JNAP round trip, so it is only awaited on
+    # the path that is already waiting on the network.
+    #
+    # A cached start deliberately does not wait for the gateway - that is the
+    # whole point of caching thermostats, so entities come back after a
+    # restart even while the gateway is still booting. There is also nothing
+    # to look up: this entry has been set up before, so
+    # _get_registered_gateway_id() has already read the identifier its gateway
+    # device is registered under, and get_gateway_id() returns exactly that.
+    # The backgrounded update above resolves the MAC properly and calls
+    # _async_retry_gateway_id(), which migrates the registry if it ever
+    # differs - so a changed or previously-unresolved id still converges,
+    # just without holding platform setup behind an 8-second timeout when the
+    # gateway is unreachable.
+    #
+    # On a first setup there is no registered id to fall back on, and
+    # async_update() above has already paid the network cost, so resolve here:
+    # device_info reads get_gateway_id() during platform setup and would
+    # otherwise register everything under the host-derived form.
+    if not started_from_cache:
+        resolved_gateway_id = await state_proxy.async_resolve_gateway_id()
+        if state_proxy._gateway_id is not None:
+            _migrate_gateway_device_id(
+                hass, config_entry, unique_id, resolved_gateway_id
+            )
 
     hass.data[unique_id] = {
         "state_proxy": state_proxy,
@@ -328,6 +679,11 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
     # to the new unique_ids instead of creating duplicate entities.
     _migrate_entity_unique_ids(hass, config_entry, unique_id)
 
+    # Same reason - must run before platform setup, so the registry no longer
+    # holds the stranded read-only/writable twin when the platforms register
+    # the side the current installer_settings value asks for.
+    carried_customizations = _remove_stale_installer_mode_entities(hass, config_entry)
+
     # Register gateway/controller devices before platform setup: CLIMATE and
     # SWITCH load before SENSOR, and their entities' via_device would
     # otherwise reference a controller device that doesn't exist yet.
@@ -335,6 +691,10 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
 
     # Forward setup for "climate" and "switch" platforms (done outside of the event loop)
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+
+    # The replacement entities exist now, so what was rescued from the twins
+    # removed above can be put back on them.
+    _restore_installer_mode_customizations(hass, carried_customizations)
 
     # Track time interval for updates (use async function)
     cancel_interval = async_track_time_interval(hass, state_proxy.async_update, SCAN_INTERVAL)
@@ -348,10 +708,9 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
 async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Update options."""
     _LOGGER.debug("Update setup entry: %s, data: %s, options: %s", entry.entry_id, entry.data, entry.options)
-    # Unload first to ensure clean state (if loaded), then reload
-    # This handles the case where setup may have failed initially
-    if entry.state in (ConfigEntryState.LOADED, ConfigEntryState.SETUP_RETRY):
-        await hass.config_entries.async_unload(entry.entry_id)
+    # async_reload() unloads first when the entry is loaded, and sets up
+    # cleanly when it is not (including after a failed initial setup), so an
+    # explicit unload here only tears the entry down twice.
     await hass.config_entries.async_reload(entry.entry_id)
 
 
@@ -363,6 +722,21 @@ async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> 
     )
     if unload_ok:
         hass.data.pop(get_unique_id_from_config_entry(config_entry), None)
+
+        # The services are registered on the domain, not on the entry, so
+        # unloading the last entry has to take them with it. Left behind, they
+        # stay callable with handlers that resolve to no state proxies and
+        # return silently. This entry may still report LOADED while its own
+        # unload is in flight, hence <= 1 rather than == 0.
+        loaded_entries = [
+            entry
+            for entry in hass.config_entries.async_entries(DOMAIN)
+            if entry.state is ConfigEntryState.LOADED
+        ]
+        if len(loaded_entries) <= 1:
+            for service in DOMAIN_SERVICES:
+                hass.services.async_remove(DOMAIN, service)
+
     return unload_ok
 
 
@@ -406,6 +780,13 @@ def _create_dump_hardware_handler(hass: HomeAssistant):
             gateway = {
                 "gateway_id": proxy.get_gateway_id(),
                 "gateway_model": proxy.get_model(),
+                "gateway_serial": proxy.get_gateway_serial(),
+                "gateway_hw_version": proxy.get_gateway_hw_version(),
+                # firmwareNumber is what the Uponor app shows; firmwareVersion
+                # is the same value in dotted form. Both are dumped so a report
+                # can be matched against either.
+                "gateway_sw_version": proxy.get_gateway_sw_version(),
+                "gateway_firmware_version": proxy._device_info.get("firmwareVersion"),
                 "controllers": [],
                 "thermostats": [],
             }
@@ -431,6 +812,15 @@ def _create_dump_hardware_handler(hass: HomeAssistant):
                     "thermostat": thermostat,
                     "sn_start": t_id[:4] if t_id else None,
                     "hardware_type_raw": proxy._data.get(thermostat + '_thermostat_type'),
+                    # _hw_type is what actually separates the parallel Wave and
+                    # Base ranges (issue #36), so a report is not diagnosable
+                    # without it. sw_version is dumped raw as well as formatted:
+                    # the controller encoding is confirmed (289 -> "1.21", and
+                    # the firmware image is X265_121.hex), the thermostat one
+                    # is not, and only the raw value can settle it.
+                    "hw_type_raw": proxy._data.get(thermostat + '_hw_type'),
+                    "sw_version_raw": proxy._data.get(thermostat + '_sw_version'),
+                    "sw_version": proxy.get_version(thermostat),
                     "detected_model": str(proxy.get_thermostat_model(thermostat)),
                     "has_humidity_control": proxy.has_humidity_control(thermostat),
                     "has_humidity_sensor": proxy.has_humidity_sensor(thermostat),
@@ -486,7 +876,12 @@ class UponorStateProxy:
         self._reload_in_progress = False
         self._last_reload_attempt = None
         self._gateway_id = None
+        self._registered_gateway_id = _get_registered_gateway_id(
+            hass, config_entry, unique_id
+        )
         self._stale_override_switches_cleaned = False
+        self._device_metadata_refreshed = False
+        self._device_info = {}
         _LOGGER.debug(f"Configdata = {self._config_entry}")
     # Controlers config  
     def get_active_controllers(self):
@@ -515,29 +910,36 @@ class UponorStateProxy:
             return STATUS_ERROR_GENERAL
         return STATUS_OK
         
+    def get_product_series(self, controller=None):
+        """Resolve Smatrix Wave Pulse vs Base Pulse for this system.
+
+        The controller firmware image name states the model outright
+        ("X265_121.hex" / "X245_122.hex"), so that is read first. Failing
+        that, the controller's own hardware type register carries the same
+        distinction. The serial number does NOT: prefix 4194 has been seen on
+        both Wave and Base controllers.
+        """
+        firmware = self._data.get('cust_SW_version_update')
+        if firmware:
+            series = CONTROLLER_FIRMWARE_SERIES.get(firmware.split('_')[0].upper())
+            if series is not None:
+                return series
+
+        candidates = [controller] if controller is not None else self.get_active_controllers()
+        for candidate in candidates:
+            raw_type = self._data.get(str(candidate) + '_hardware_type')
+            if raw_type is not None:
+                series = CONTROLLER_HARDWARE_SERIES.get(str(raw_type))
+                if series is not None:
+                    return series
+        return None
+
     def get_controller_hardware(self, controller):
-        var = controller + '_hardware_type'
-        if var in self._data:
-            hwid = int(self._data[var])
-            controller_id = self.get_controller_id(controller)
-            if controller_id is None:
-                return None
-            sn = controller_id[:4]
-            prodk = sn[:3]
-            mod = sn[-1:]
-            _LOGGER.debug(f"id {hwid} s/n start {sn}")            
-            if prodk=="419":
-                if mod=="5":
-# Smartix Base Pulse
-                    return("X-245")
-# Smatrix Wave Pulse
-#                   return("X-265")
-# Smatrix Base PRO
-#                   return("X-147")
-# Modbus RTU model  return("X-147")
-            # The raw hardware type is a device class, not a model id -
-            # report no model rather than a misleading number.
+        """The controller's model: X-265 (Wave Pulse) or X-245 (Base Pulse)."""
+        series = self.get_product_series(controller)
+        if series is None:
             return None
+        return SERIES_CONTROLLER_MODELS.get(series)
 
     def get_controller_name(self, controller):
         configured_name = self._config_entry.data.get(controller.lower())
@@ -558,32 +960,73 @@ class UponorStateProxy:
         return self._config_entry.data.get(CONF_NAME, DEVICE_MANUFACTURER)
 
     def get_gateway_id(self) -> str:
-        """Return cached gateway ID (MAC or host fallback)."""
-        if self._gateway_id is None:
-            # Cache not yet populated; return host fallback until async_resolve_gateway_id runs
-            return self._host.replace('.', '')
-        return self._gateway_id
+        """Return the confirmed MAC, retained registry ID, or host fallback."""
+        return (
+            self._gateway_id
+            or self._registered_gateway_id
+            or self._host.replace('.', '')
+        )
 
     async def async_resolve_gateway_id(self) -> str:
-        """Resolve gateway MAC via ARP (with UDP socket to prime ARP cache) and cache it."""
-        if self._gateway_id is None:
-            mac = get_mac_address(ip=self._host)
-            _LOGGER.debug("Direct get_mac_address(%s) (no ARP priming) returned: %s", self._host, mac)
-            if mac is not None:
-                self._gateway_id = mac.replace(':', '').upper()
-            else:
-                mac = await self._hass.async_add_executor_job(
-                    _get_mac_with_arp_refresh, self._host
+        """Resolve and cache the gateway MAC, retaining a stable fallback.
+
+        The gateway reports its own MAC as `deviceID` in the JNAP core action,
+        so this is a read rather than a network-topology guess. That replaces
+        the previous getmac/ARP lookup, which could only see a gateway on the
+        same broadcast domain, needed an executor hop to stay off the event
+        loop, and returned nothing at all on a cold ARP cache - the drift that
+        left an orphaned gateway device behind.
+
+        The normalised form is unchanged ("AA:BB:CC:DD:EE:FF" -> "AABBCCDDEEFF"), so
+        an install that already resolved a MAC keeps the exact identifier it
+        registered and nothing migrates.
+
+        A gateway that does not answer the core action keeps a previously
+        registered id, or the host form on a new install. Neither fallback is
+        stored in _gateway_id, so later polls keep trying.
+        """
+        if self._gateway_id is not None:
+            return self._gateway_id
+
+        await self.async_load_device_info()
+        mac = self._device_info.get("deviceID")
+        _LOGGER.debug("JNAP GetDeviceInfo deviceID for %s returned: %s", self._host, mac)
+
+        if not mac:
+            # A previous successful run may already have registered a stable
+            # MAC identifier. Retain that exact identity instead of migrating
+            # it backwards to the IP-derived fallback after one failed lookup.
+            if self._registered_gateway_id is None:
+                self._registered_gateway_id = _get_registered_gateway_id(
+                    self._hass, self._config_entry, self._unique_id
                 )
-                if mac is not None:
-                    self._gateway_id = mac.replace(':', '').upper()
-                else:
-                    _LOGGER.warning(
-                        "Could not resolve MAC address for %s, using host as fallback",
-                        self._host,
-                    )
-                    self._gateway_id = self._host.replace('.', '')
+            fallback_id = self.get_gateway_id()
+            _LOGGER.warning(
+                "Gateway %s did not report a deviceID; retaining gateway id %s "
+                "until it resolves on a later poll",
+                self._host,
+                fallback_id,
+            )
+            return fallback_id
+
+        self._gateway_id = mac.replace(':', '').upper()
         return self._gateway_id
+
+    async def _async_retry_gateway_id(self) -> None:
+        """Second chance at the MAC after a startup fallback, then repair the registry."""
+        resolved = await self.async_resolve_gateway_id()
+        if self._gateway_id is None:
+            return
+
+        _LOGGER.info(
+            "Resolved gateway MAC for %s after starting on fallback id %s: %s",
+            self._host,
+            self._registered_gateway_id or self._host.replace('.', ''),
+            resolved,
+        )
+        _migrate_gateway_device_id(
+            self._hass, self._config_entry, self._unique_id, resolved
+        )
 
     def get_pump_management(self):
         var = 'sys_pump_management'
@@ -637,7 +1080,11 @@ class UponorStateProxy:
     def get_controller_version(self, controller):
         var = controller + '_sw_version'
         if var in self._data:
-            hexver = hex(int(self._data[var])).replace('0x', '')
+            # Uppercase for the same reason as get_version: the encoding is
+            # hex. Controller versions observed so far are all digits
+            # (289 -> "1.21", matching the X265_121.hex image name), so this
+            # only shows up on a revision that reaches A-F.
+            hexver = hex(int(self._data[var])).replace('0x', '').upper()
             return hexver[:-2] + '.' + hexver[-2:]
         return None
 
@@ -697,6 +1144,11 @@ class UponorStateProxy:
     # -------------------------------------------------------------------------
 
     async def async_load_storage(self):
+        async with self._storage_lock:
+            await self._async_load_storage_unlocked()
+
+    async def _async_load_storage_unlocked(self):
+        """Load storage while the caller holds _storage_lock."""
         data = await self._store.async_load()
         if not isinstance(data, dict):
             self._storage_data = {}
@@ -732,77 +1184,77 @@ class UponorStateProxy:
         if not thermostats:
             return
 
-        # Merge with previously cached thermostats so that a transient JNAP
-        # response missing one thermostat does not permanently remove it from
-        # cache and cause its entity to be missing after the next HA restart.
-        cached_controllers = self._storage_metadata.get("controllers", [])
-        merged_controllers = list(dict.fromkeys(
-            controllers + [t for t in cached_controllers if t not in controllers]        
-        ))
-        
-        cached_thermostats = self._storage_metadata.get("thermostats", [])
-        merged_thermostats = list(dict.fromkeys(
-            thermostats + [t for t in cached_thermostats if t not in thermostats]
-        ))
+        async with self._storage_lock:
+            # Merge with previously cached thermostats so that a transient
+            # JNAP response missing one thermostat does not permanently remove
+            # it from cache and hide its entity after the next HA restart.
+            cached_controllers = self._storage_metadata.get("controllers", [])
+            merged_controllers = list(dict.fromkeys(
+                controllers + [t for t in cached_controllers if t not in controllers]
+            ))
 
-        new_metadata = {
-            "gateway_id": self._data.get('cust_ip_device'),
-            "controllers": merged_controllers,
-            "controller_names" : {
-                **self._storage_metadata.get("controller_names", {}),
-                **{
-                    controller: controller_name
-                    for controller in self.get_active_controllers()
-                    if (controller_name := self.get_controller_name(controller))
-                },
-            },
-            "controller_ids": {
-                **self._storage_metadata.get("controller_ids", {}),
-                **{
-                    controller: controller_id
-                    for controller in self.get_active_controllers()
-                    if (controller_id := self.get_controller_id(controller))
-                },
-            },
-            "thermostats": merged_thermostats,
-            "ids": {
-                **self._storage_metadata.get("ids", {}),
-                **{
-                    thermostat: thermostat_id
-                    for thermostat in thermostats
-                    if (thermostat_id := self._get_thermostat_id_from_data(thermostat))
-                },
-            },
-            "rooms": {
-                **self._storage_metadata.get("rooms", {}),
-                **{
-                    thermostat: room_name
-                    for thermostat in thermostats
-                    if (room_name := self._get_room_name_from_data(thermostat))
-                },
-            },
-            "models": {
-                **self._storage_metadata.get("models", {}),
-                **{
-                    thermostat: model
-                    for thermostat in thermostats
-                    if (model := self._detect_thermostat_model(thermostat))
-                },
-            },
-            "humidity": list(dict.fromkeys(
-                [thermostat for thermostat in thermostats if thermostat + '_rh' in self._data and int(self._data[thermostat + '_rh']) != 0]
-                + self._storage_metadata.get("humidity", [])
-            )),
-            "floor": list(dict.fromkeys(
-                [thermostat for thermostat in thermostats if thermostat + '_external_temperature' in self._data and int(self._data[thermostat + '_external_temperature']) != 32767]
-                + self._storage_metadata.get("floor", [])
-            )),
-            "cooling_available": self._data.get('sys_cooling_available') == "1",
-        }
+            cached_thermostats = self._storage_metadata.get("thermostats", [])
+            merged_thermostats = list(dict.fromkeys(
+                thermostats + [t for t in cached_thermostats if t not in thermostats]
+            ))
 
-        if new_metadata != self._storage_metadata:
-            self._storage_metadata = new_metadata
-            async with self._storage_lock:
+            new_metadata = {
+                "gateway_id": self._data.get('cust_ip_device'),
+                "controllers": merged_controllers,
+                "controller_names" : {
+                    **self._storage_metadata.get("controller_names", {}),
+                    **{
+                        controller: controller_name
+                        for controller in self.get_active_controllers()
+                        if (controller_name := self.get_controller_name(controller))
+                    },
+                },
+                "controller_ids": {
+                    **self._storage_metadata.get("controller_ids", {}),
+                    **{
+                        controller: controller_id
+                        for controller in self.get_active_controllers()
+                        if (controller_id := self.get_controller_id(controller))
+                    },
+                },
+                "thermostats": merged_thermostats,
+                "ids": {
+                    **self._storage_metadata.get("ids", {}),
+                    **{
+                        thermostat: thermostat_id
+                        for thermostat in thermostats
+                        if (thermostat_id := self._get_thermostat_id_from_data(thermostat))
+                    },
+                },
+                "rooms": {
+                    **self._storage_metadata.get("rooms", {}),
+                    **{
+                        thermostat: room_name
+                        for thermostat in thermostats
+                        if (room_name := self._get_room_name_from_data(thermostat))
+                    },
+                },
+                "models": {
+                    **self._storage_metadata.get("models", {}),
+                    **{
+                        thermostat: model
+                        for thermostat in thermostats
+                        if (model := self._detect_thermostat_model(thermostat))
+                    },
+                },
+                "humidity": list(dict.fromkeys(
+                    [thermostat for thermostat in thermostats if thermostat + '_rh' in self._data and int(self._data[thermostat + '_rh']) != 0]
+                    + self._storage_metadata.get("humidity", [])
+                )),
+                "floor": list(dict.fromkeys(
+                    [thermostat for thermostat in thermostats if thermostat + '_external_temperature' in self._data and int(self._data[thermostat + '_external_temperature']) != 32767]
+                    + self._storage_metadata.get("floor", [])
+                )),
+                "cooling_available": self._data.get('sys_cooling_available') == "1",
+            }
+
+            if new_metadata != self._storage_metadata:
+                self._storage_metadata = new_metadata
                 await self._store.async_save(self._compose_storage_payload())
 
     # -------------------------------------------------------------------------
@@ -851,68 +1303,124 @@ class UponorStateProxy:
         return self._storage_metadata.get("models", {}).get(thermostat)
 
     def _detect_thermostat_model(self, thermostat):
+        """Identify a thermostat from its hardware type within the product series.
+
+        The two Smatrix ranges run in parallel (T-146<->T-166, T-148<->T-168,
+        T-149<->T-169) and report the same `_thermostat_type`, so that value
+        alone cannot name a model - every `_thermostat_type == 2` unit used to
+        be reported as T-146, including the sixteen T-169s that prompted
+        issue #36. `_hw_type` does separate them once the series is known.
+
+        Reference ranges, from the product documentation:
+          Base Pulse (X-245): T-141 T-143 T-144 T-145 T-146 T-148 T-149
+          Wave Pulse (X-265): T-161 T-162 T-163 T-165 T-166 T-168 T-169
+
+        Only combinations actually observed on a system whose models were
+        confirmed by its owner appear in THERMOSTAT_MODELS. Anything else
+        returns None - the raw hardware type is a device class, not a model
+        id, and reporting no model beats reporting a wrong one.
+        """
         var = thermostat + '_thermostat_type'
         if var not in self._data:
             return None
         hwid = int(self._data[var])
-        sn = self.get_thermostat_id(thermostat)[:4]
-        prodk = sn[:3]
-        mod = sn[-1:]
-        
-        if hwid==0:
-            # T-144 and T-145 report the same hardware id, but looking at a
-            # number of T-144/T-145 units we had on hand, the serial number
-            # prefix appears usable for telling them apart.
-            # Every other hwid==0 unit defaults to T-145 — Uponor's own app
-            # seems to do the same when it can't tell either.
-            if prodk=="269":
-                if mod=="1":
-                    return ('T-144')
-                if mod=="2":
-                    return ('T-145')
-            if prodk=="268":
-                # sn 2688 — kept as a marker in case a pattern emerges once
-                # we have data from more thermostats; currently redundant
-                # with the T-145 fallback below.
-                return('T-145')
-            return('T-145')
-        if hwid==2:
-            # sn 2856
-            return('T-146')
-        _LOGGER.debug(f"id {hwid} s/n start {sn} rh_c {self.has_humidity_control(thermostat)} rh_s {self.has_humidity_sensor(thermostat)} pd {self.is_public_device(thermostat)} hft {self.has_floor_temperature(thermostat)} Sensor only {self.is_sensor_only(thermostat)}")
-# Smartix Base Pulse                   
-#                   return("T-141") #No temp adjustment/RH
-#                   return("T-143") #No temp adjustment/External temp/Tamper Alarm
-#                   return("T-144") #Nobb for temp/inwall mount same as T145
-#                   return("T-146") #Digital display/External temp
-#                   return("T-148") #Digital display/External temp/RH/TimeDate
-#                   return("T-149") #Digital display/External temp/RH 
-# Smatrix Wave Pulse
-#                   return("T-161") #No temp adjustment/RH
-#                   return("T-162") #Digital display/External temp                  
-#                   return("T-163") #No temp adjustment/External temp/Tamper Alarm
-#                   return("T-165") #Nobb for temp
-#                   return("T-166") #Digital display/External temp
-#                   return("T-168") #Digital display/External temp/RH/TimeDate
-#                   return("T-169") #Digital display/External temp/RH
-#                    return("T-247")
-        # The raw hardware type is a device class, not a model id -
-        # report no model rather than a misleading number.
+
+        if hwid == 0:
+            # The dial family. T-144 and T-145 report the same hardware id and
+            # the same _hw_type, so the serial prefix is still the only thing
+            # separating them. This rule is field-confirmed on Base units
+            # only; a Wave T-165 has never been observed, so it is left to
+            # fall through to the series/hw_type lookup below rather than
+            # being labelled from Base data.
+            sn = self.get_thermostat_id(thermostat)[:4]
+            prodk = sn[:3]
+            mod = sn[-1:]
+            if self.get_product_series(thermostat.split('_')[0]) != SERIES_WAVE:
+                if prodk == "269" and mod == "1":
+                    return 'T-144'
+                # Every other Base dial defaults to T-145 - Uponor's own app
+                # appears to do the same when it cannot tell either.
+                return 'T-145'
+
+        series = self.get_product_series(thermostat.split('_')[0])
+        hw_type = self._data.get(thermostat + '_hw_type')
+        if series is not None and hw_type is not None:
+            model = THERMOSTAT_MODELS.get((series, str(hw_type)))
+            if model is not None:
+                return model
+
+        _LOGGER.debug(
+            "Unrecognised thermostat %s: series=%s thermostat_type=%s hw_type=%s "
+            "sn_start=%s rh=%s floor=%s public=%s sensor_only=%s - reporting no "
+            "model. Please attach this line to a report so it can be mapped.",
+            thermostat, series, hwid, hw_type, self.get_thermostat_id(thermostat)[:4],
+            self.has_humidity_sensor(thermostat), self.has_floor_temperature(thermostat),
+            self.is_public_device(thermostat), self.is_sensor_only(thermostat),
+        )
         return None
 
     def get_model(self):
         return "R-208"
 
-    def get_sw_version(self):
-        var = 'cust_SW_version_update'
-        if var in self._data:
-            return self._data[var].split('_')[0]
-        return '-'
+    async def async_load_device_info(self):
+        """Fetch the gateway's own identity once per setup.
+
+        Best-effort: a gateway that does not answer the core action still has
+        a fully working attribute set, so a failure here must not take the
+        integration down with it.
+        """
+        if self._device_info:
+            return
+        try:
+            self._device_info = await self._client.get_device_info() or {}
+        except Exception as exc:  # pylint: disable=broad-except
+            # Left empty rather than marked failed: the gateway id depends on
+            # this, so a later poll must be free to try again.
+            _LOGGER.debug("Could not read gateway device info: %s", exc)
+            return
+        _LOGGER.debug("Gateway device info: %s", self._device_info)
+
+    def get_gateway_sw_version(self):
+        """The comm module's firmware, as the Uponor app reports it.
+
+        The app shows the plain firmwareNumber (e.g. 20006006), so that is
+        what is surfaced here - an owner comparing the two sees the same
+        string. firmwareVersion carries the same value in dotted form
+        ("Sky_smatrixrelease_2_0_6_6_locked" -> 2.0.6.6) and is in the
+        hardware dump for anyone who wants it.
+        """
+        number = self._device_info.get("firmwareNumber")
+        return str(number) if number is not None else None
+
+    def get_gateway_mac(self):
+        """The gateway's MAC, or None if it has never reported one.
+
+        Deliberately separate from get_gateway_id(): that is a registry key
+        which may be a host-derived fallback, while this is only ever a real
+        MAC. Recording it as a device *connection* is what lets Home
+        Assistant's DHCP discovery recognise the gateway after it changes IP.
+        """
+        mac = self._device_info.get("deviceID")
+        return device_registry.format_mac(mac) if mac else None
+
+    def get_gateway_hw_version(self):
+        version = self._device_info.get("hardwareVersion")
+        return str(version) if version is not None else None
+
+    def get_gateway_serial(self):
+        """The printed serial, falling back to the identifier when unknown."""
+        return self._device_info.get("serialNumber") or self.get_gateway_id()
 
     def get_version(self, thermostat):
+        """The thermostat's firmware revision, e.g. raw 12 -> "C".
+
+        Uponor renders these as uppercase hex; a thermostat revision is a
+        single digit, so it is shown without the major/minor split that
+        get_controller_version applies.
+        """
         var = thermostat + '_sw_version'
         if var in self._data:
-            return hex(int(self._data[var])).replace("0x", "")
+            return hex(int(self._data[var])).replace("0x", "").upper()
         return None
 
     # -------------------------------------------------------------------------
@@ -1108,7 +1616,7 @@ class UponorStateProxy:
         off_temp = self.get_max_limit(thermostat) if self.is_cool_enabled() else self.get_min_limit(thermostat)
         current = self.get_setpoint(thermostat)
         async with self._storage_lock:
-            await self.async_load_storage()
+            await self._async_load_storage_unlocked()
             if current != off_temp:
                 # Don't record the off value itself as the restore target.
                 self._storage_data[thermostat] = current
@@ -1118,7 +1626,7 @@ class UponorStateProxy:
     async def async_remember_setpoint(self, thermostat, temp):
         """Record a target temperature requested while the room is off, so turn_on restores it."""
         async with self._storage_lock:
-            await self.async_load_storage()
+            await self._async_load_storage_unlocked()
             self._storage_data[thermostat] = temp
             await self._store.async_save(self._compose_storage_payload())
 
@@ -1207,6 +1715,23 @@ class UponorStateProxy:
                         self._hass, self._config_entry, self._unique_id,
                         self, self.get_active_thermostats(),
                     )
+
+                # device_info was evaluated during platform setup, which on a
+                # cached startup happens before any live data exists. Now that
+                # it does, reconcile the registry with it.
+                await self.async_load_device_info()
+                if not self._device_metadata_refreshed:
+                    self._device_metadata_refreshed = True
+                    _refresh_device_metadata(
+                        self._hass, self._config_entry, self._unique_id,
+                        self, self.get_active_thermostats(),
+                    )
+
+                # The MAC may not have been resolvable at setup. Retry here so
+                # the session converges on the real identifier rather than
+                # running on the host fallback until the next restart.
+                if self._gateway_id is None:
+                    await self._async_retry_gateway_id()
 
                 self._hass.async_create_task(self.call_state_update())
                 return

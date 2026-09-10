@@ -1,3 +1,15 @@
+# Floating rather than pinned: the integration itself is clean on current HA.
+#
+# This was pinned to 0.13.357 (HA 2026.8.3) while the integration still called
+# `device_registry.async_get_device`, which HA 2026.9 promotes from a
+# deprecation warning to a hard RuntimeError. Those calls now go through the
+# compat shims in custom_components/uponorx265/helper.py, so the suite is
+# green on the 2026.9 betas.
+#
+# One consequence: the three tests in tests/test_ha_compat_shims.py cover the
+# pre-2026.8 fallback branches by calling the deprecated APIs on purpose, and
+# 2026.9 raises on those, so they skip themselves there. Run the suite against
+# HA 2026.8 as well if you change the shims - see tests/README.md.
 pytest-homeassistant-custom-component
 pytest-asyncio
 tzdata; sys_platform == "win32"

@@ -93,7 +93,10 @@
     "error": {
       "invalid_host": "Ogiltigt värdnamn eller IP-adress."
     },
-    "abort": {}
+    "abort": {
+      "already_configured": "Den här Uponor-gatewayen är redan konfigurerad.",
+      "not_uponor_device": "Den här enheten är inte en känd Uponor-gateway."
+    }
   },
   "options": {
     "step": {
@@ -111,7 +114,8 @@
           "sensor_temperature": "Skapa rumstemperatursensor",
           "binary_sensor_valve": "Skapa ventil-binärsensor",
           "switch_sensor_avg": "Skapa binärsensor för medelvärdesinkludering",
-          "controller_io": "Skapa relay/IO-sensorer för styrenhet"
+          "controller_io": "Skapa relay/IO-sensorer för styrenhet",
+          "installer_settings": "Installatörsläge (reläer, bypass och pumpstyrning)"
         }
       }
     }

@@ -21,33 +21,78 @@ Home Assistant custom integration that connects to an **Uponor Smatrix Pulse** g
 ### State layer — [__init__.py](custom_components/uponorx265/__init__.py)
 `UponorStateProxy` is the central class: keeps the raw data (`_data`) in memory, polls the gateway on `SCAN_INTERVAL` (30s), and exposes typed getters/setters (`get_setpoint`, `async_set_target_temperature`, `get_bypass_enable`, etc.) that the platform files build entities from. On every update, `SIGNAL_UPONOR_STATE_UPDATE` is sent via HA's dispatcher so all entities update at once. Data is also cached in `Store` (per config entry) for fast restarts. The module also registers the integration's services (`set_variable`, `dump_hardware_info`, `dump_raw_data`).
 
-### Gateway ID (MAC resolution) — [__init__.py](custom_components/uponorx265/__init__.py) / [helper.py](custom_components/uponorx265/helper.py)
-The gateway's `device_info` identifier and serial number are based on its MAC address when it can be resolved, otherwise it falls back to a host-based ID (the IP address with dots stripped). `UponorStateProxy.async_resolve_gateway_id()` runs in `async_setup_entry` before the platforms are set up (since `device_info` reads `get_gateway_id()`), and tries, in order:
+### Gateway ID (MAC address) — [__init__.py](custom_components/uponorx265/__init__.py)
+The gateway's `device_info` identifier is based on its MAC address when it can be resolved, otherwise it falls back to a host-based ID (the IP address with dots stripped).
 
-1. `get_mac_address(ip=host)` directly — works if the OS's ARP cache already has an entry.
-2. `_get_mac_with_arp_refresh()` in [helper.py](custom_components/uponorx265/helper.py) — primes the ARP cache by actually sending data over a UDP socket (not just `connect()`, which doesn't guarantee anything is sent), then tries `getmac` again, and as a last resort reads `/proc/net/arp` directly (for HA installs in Docker where the `arp`/`ip neighbor` binaries may be missing from the container).
-3. The MAC address is uppercased (`.upper()`) before being used as the ID.
+`UponorStateProxy.async_resolve_gateway_id()` is a JNAP round trip, so `async_setup_entry` only awaits it **on a first setup** — the path that already awaits the first poll, and the only one where `get_gateway_id()` has nothing better than the host form to give `device_info` during platform setup.
 
-**Important limitation:** ARP only works within the same broadcast domain/subnet. If the HA host and the gateway are on different subnets/VLANs, the MAC address can never be resolved (the kernel never gets an ARP entry for it), and it permanently falls back to the host-based ID — this is not a code bug, it's a network topology limitation.
+A cached start skips it. Caching thermostats exists so entities come back after a restart while the gateway is still booting, and awaiting the network there would put an ~8-second timeout (three attempts at a 2s connect timeout, plus backoff) in front of every entity whenever the gateway is unreachable. It is also redundant: a cached start means the entry has been set up before, so `_get_registered_gateway_id()` has already read the identifier the gateway device is registered under and `get_gateway_id()` returns exactly that. The backgrounded poll resolves the real MAC and `_async_retry_gateway_id()` migrates the registry if it ever differs, so a changed or never-resolved id still converges — just without holding up setup.
 
-Since the gateway ID's format can change over time (host-based → lowercase MAC → uppercase MAC, in the order the integration has evolved) — and the host-based fallback itself can drift across restarts if MAC resolution keeps failing while DHCP reassigns the IP — `_migrate_gateway_device_id()` handles the transition. Rather than guessing at specific old id strings (which would miss that drift), it identifies the old device *structurally*: for a given config entry there is exactly one device with no `via_device` (the root of the gateway/controller/thermostat hierarchy), whatever identifier it currently happens to hold. It renames that device's identifier in place if no device already exists under the new identifier, or carries over the area/custom name and removes the old device if one does (created by a prior restart before this reconciliation ran). This runs on every startup and is idempotent.
+The MAC is **read from the gateway**, not inferred from the network: the JNAP core action `http://phyn.com/jnap/core/GetDeviceInfo` reports it as `deviceID` (e.g. `AA:BB:CC:DD:EE:FF`), which is uppercased and stripped of colons before being used as the ID. The same response carries the gateway's printed serial number, hardware version and firmware (`firmwareNumber`, the value the Uponor app displays) — none of which appear anywhere in the `uponorsky/GetAttributes` variable set, because that set describes the controllers and thermostats *behind* the comm module rather than the module itself. See "Gateway device info" below.
+
+If the gateway does not report a `deviceID`, a previously registered stable identifier is retained; a new installation uses the host-based form. Neither fallback is cached as a confirmed result, so later polls keep retrying and `_async_retry_gateway_id()` repairs the registry once a real MAC arrives.
+
+> **Historical note.** Until this was found, the MAC was resolved with `getmac` plus a hand-rolled ARP-cache prime (a UDP socket sent to force an ARP entry, then a direct read of `/proc/net/arp` for containers without `arp`/`ip neighbor`). That approach needed an executor hop to stay off the event loop, returned nothing on a cold ARP cache — the drift that left an orphaned gateway device behind — and was documented here as having an **unfixable limitation**: ARP only works within one broadcast domain, so a gateway on another subnet or VLAN could never be identified. That limitation was an artefact of the lookup method, not of the protocol. Asking the device works across subnets, and the `getmac` dependency is gone.
+
+Since the gateway ID's format can change over time (host-based → lowercase MAC → uppercase MAC, in the order the integration has evolved), `_migrate_gateway_device_id()` handles transitions backed by a confirmed MAC lookup. Rather than guessing at specific old id strings, it identifies the old device *structurally*: for a given config entry there is exactly one device with no `via_device` (the root of the gateway/controller/thermostat hierarchy), whatever identifier it currently happens to hold. It renames that device's identifier in place if no device already exists under the new identifier, or safely moves attached entities and child devices before removing a duplicate. The confirmed MAC and the retained registry fallback are stored separately so a failed lookup cannot cause MAC → IP → MAC identifier oscillation, while later polls can still retry resolution.
+
+### Gateway device info (the JNAP surface) — [jnap.py](custom_components/uponorx265/jnap.py)
+The gateway speaks JNAP at `http://<host>/JNAP/`, dispatching on an `x-jnap-action` header. Probing every plausible action across the five services it advertises (`attribute`, `core`, `setup`, `update`, `uponorsky`) turns up exactly **three** that answer:
+
+| Action | Returns |
+|---|---|
+| `http://phyn.com/jnap/uponorsky/GetAttributes` | every variable (~1300) — controllers, thermostats, system settings. The integration's `get_data()`. |
+| `http://phyn.com/jnap/core/GetDeviceInfo` | the comm module's own identity — see below. |
+| `http://phyn.com/jnap/update/GetFirmwareUpdateSettings` | `{"isAutoFirmwareUpdateEnabled": true}` — the *gateway's* firmware auto-update, distinct from `cust_Enable_SW_Update`, which governs controller firmware distribution. |
+
+`uponorsky/SetAttributes` writes; `uponorsky/GetAttribute` (singular) exists for targeted reads but expects an input schema that has not been worked out, and offers nothing the bulk call does not. Everything else returns `_ErrorUnknownAction`. **There is no separate thermostat or controller dump** — `GetAttributes` is the entire data surface, which is why `dump_raw_data` returning it is genuinely everything available.
+
+`core/GetDeviceInfo` takes an empty payload and returns the fields the attribute set has no equivalent for:
+
+```
+deviceID:        AA:BB:CC:DD:EE:FF          -> the gateway ID, uppercased and de-colonned
+serialNumber:    000000XX000000             -> device_info serial_number (the printed one)
+hardwareVersion: 1                          -> device_info hw_version
+firmwareNumber:  20006006                   -> device_info sw_version; matches the Uponor app
+firmwareVersion: Sky_smatrixrelease_2_0_6_6_locked
+deviceName / manufacturer / productCode / description / firmwareDate / services
+```
+
+`firmwareNumber` and `firmwareVersion` carry the same version in two renderings (`2_0_6_6` -> `20006006`); the app shows the number, so that is what the device page shows. `UponorStateProxy.async_load_device_info()` fetches this once per setup and is best-effort — a gateway that does not answer keeps a fully working attribute set, so a failure must not fail setup. It is deliberately not cached on failure, because the gateway ID depends on it and a later poll must be free to retry.
+
+### Recovering from a gateway IP change — [config_flow.py](custom_components/uponorx265/config_flow.py)
+The MAC has always been the gateway device's registry key, so a DHCP move never renamed the device. It did not help the integration *reach* a moved gateway: `CONF_HOST` stays whatever address was typed into the config flow, and a move simply made the entry unavailable.
+
+Three pieces close that gap:
+
+1. `_register_gateway_devices()` records the MAC as a device **connection** (`CONNECTION_NETWORK_MAC`), not only inside the identifier string. HA matches DHCP leases against connections; an identifier is opaque to it.
+2. The manifest declares `"dhcp": [{"registered_devices": true}]`, which asks HA to watch leases for MACs this integration has registered — it never triggers for an unknown device.
+3. `DomainConfigFlow.async_step_dhcp()` maps the MAC back to the config entry through the device registry and rewrites the host.
+
+The entry's `unique_id` is derived from the user's chosen name, not the MAC, so the usual `_abort_if_unique_id_configured(updates={CONF_HOST: ...})` shortcut cannot find it — the device registry is the only link between the two. A MAC may also be registered by other integrations (a router, a device tracker), so every matching device is examined and only an entry in this domain is touched.
+
+**The host must be written to both `data` and `options`.** `_sync_entry_config()` merges them as `{**FLAG_DEFAULTS, **data, **options}`, so options win; updating `data` alone is silently reverted to the stale address on the next setup.
+
+Limits worth knowing: recovery waits for the next lease renewal, and HA has to be able to observe DHCP traffic at all (fine on HAOS/Supervised, not guaranteed for containers on a bridge network). A gateway on another subnet is not seen either — though note the JNAP MAC read *does* work cross-subnet, so the device identity stays correct there even when this recovery path cannot fire. None of this was possible with the previous ARP-based lookup, which could not produce a MAC to register in exactly those situations.
 
 ### Device registration ordering — [__init__.py](custom_components/uponorx265/__init__.py)
-Thermostat and controller entities declare a `via_device` pointing at their parent (controller, then gateway) in their `device_info`. Historically the parent device only ever got created as a side effect of a specific entity — a controller status sensor, gated behind the optional `CONF_CREATE_CONTROLLERS` — which lives in the `SENSOR` platform, loaded *after* `CLIMATE` and `SWITCH` in `PLATFORMS`. HA would log a `via_device` referencing a non-existing device warning and eventually stop honoring it, and if the controller sensor was disabled the parent device was never created at all.
+Thermostat and controller entities link their device to its parent (controller, then gateway) from their `device_info`. Historically the parent device only ever got created as a side effect of a specific entity — a controller status sensor, gated behind the optional `CONF_CREATE_CONTROLLERS` — which lives in the `SENSOR` platform, loaded *after* `CLIMATE` and `SWITCH` in `PLATFORMS`. HA would log a `via_device` referencing a non-existing device warning and eventually stop honoring it, and if the controller sensor was disabled the parent device was never created at all.
 
 `_register_gateway_devices()` fixes this by registering the gateway and controller devices explicitly in `async_setup_entry`, before `async_forward_entry_setups()` is called — so the parent always exists regardless of platform order or which optional entities are enabled. It falls back to `get_cached_controllers()` (mirroring `get_cached_thermostats()`) when live data isn't loaded yet, e.g. on a warm restart where `async_update()` runs as a background task instead of being awaited.
+
+Ordering became load-bearing rather than merely tidy when the link moved to `via_device_id`. HA 2026.9 deprecated `via_device` (the parent's *identifier tuple*, which the registry resolved for you, tolerating a miss with a log line) in favour of `via_device_id` (the parent's *registry id*), so `device_info` now has to resolve the parent itself — `_via_device_info()` in [helper.py](custom_components/uponorx265/helper.py). A `via_device_id` naming no registered device raises `DeviceInfoError` and the entity platform drops the entity, so an unresolved parent yields no link at all rather than a bad one: a flat device tree, never a missing entity.
 
 ### Setpoint storage & restore-on-off — [__init__.py](custom_components/uponorx265/__init__.py) / [climate.py](custom_components/uponorx265/climate.py)
 The integration has no real on/off register — "off" is encoded as `setpoint == min_temp` (or `max_temp` in cool mode). The `.storage` file's per-thermostat setpoint memo is therefore the only thing that can restore a room to its pre-off temperature, which makes its read-modify-write path load-bearing:
 
-- **`self._storage_lock`** (`asyncio.Lock`) serialises every read-modify-write against `_storage_data`: `async_turn_off()`, `async_remember_setpoint()`, and the metadata-refresh save in `_async_persist_discovery_metadata()` all take it. Without this, HA turning off several thermostats in one service call runs those coroutines concurrently; each would load its own fresh copy of the storage dict, mutate only its own key, and save — last writer wins, silently discarding every other room's memo.
+- **`self._storage_lock`** (`asyncio.Lock`) serialises every storage load and read-modify-write against both `_storage_data` and `_storage_metadata`: `async_turn_off()`, `async_remember_setpoint()`, `async_turn_on()`, and the complete metadata merge/assign/save transaction all take it. A load replaces both in-memory dictionaries, so locking only the final save would still allow an older suspended load to erase a newer update. Without this serialization, concurrent service calls or a discovery refresh can produce a last-writer-wins save that silently discards setpoint memos or discovery metadata.
 - **`async_turn_off()`** never memorises the off value (`min_temp`/`max_temp`) itself as the restore target — doing so would permanently strand the room off, since `async_turn_on()` would just write the off value straight back. **`async_turn_on()`** also treats a previously-poisoned memo (one that does equal the off value, e.g. left over from before this fix) as "no memo" and falls back to `DEFAULT_TEMP` instead of restoring it.
 - **`async_remember_setpoint()`** backs `UponorClimate.async_set_temperature()` when the room is off: rather than silently discarding the request (the old behavior) or writing the live setpoint through (which would silently turn the room back on, violating `hvac_mode: off`), it records the requested temperature in storage so the next `turn_on` restores exactly what was asked for.
 
 ### Entity base — [helper.py](custom_components/uponorx265/helper.py)
 Three base classes build a device hierarchy in HA:
 
-| Base class | Device | `via_device` |
+| Base class | Device | Parent (`via_device_id`) |
 |---|---|---|
 | `UponorGatewayEntity` | Gateway (root) | — |
 | `UponorControllerEntity` | Controller | Gateway |
@@ -91,6 +136,8 @@ The suite is weighted towards regression coverage for bugs found during review r
 | [test_gateway_device_migration.py](tests/test_gateway_device_migration.py) | The gateway device migration finds the old device structurally, including after host-id drift |
 | [test_bypass_max_two.py](tests/test_bypass_max_two.py) | The max-2-bypass-zones-per-controller business rule, and that it's per-controller not global |
 | [test_thermostat_model_detection.py](tests/test_thermostat_model_detection.py) | The `hwid`/serial-prefix model detection heuristic and its cache fallback |
+| [test_installer_mode_entity_cleanup.py](tests/test_installer_mode_entity_cleanup.py) | Toggling `installer_settings` removes the read-only/writable twin it replaces, scoped to its own config entry |
+| [test_installer_mode_setup_flow.py](tests/test_installer_mode_setup_flow.py) | The same, end to end through real platform setup — the restore pass depends on `async_forward_entry_setups()` having registered the replacement by the time it returns |
 
 Note on the storage-race test specifically: `pytest-homeassistant-custom-component`'s mocked `Store.async_save` never actually suspends (no executor read, no disk write), so without an explicit forced yield point (`asyncio.sleep(0)` injected into the mock) the test can pass "by accident" on platforms/schedulers where the mocked coroutines happen to run to completion sequentially anyway — masking a regression instead of catching it. The injected yield point makes the test deterministic regardless of platform.
 
@@ -102,7 +149,7 @@ Windows-specific: `tests/conftest.py` neutralises `pytest_socket.disable_socket(
 
 **Two-tier feature model**, driven by flags in the config entry:
 - `controller_io` → creates relay/IO sensors per controller (pump relay, boiler demand)
-- `installer_settings` ("Installer mode") → makes relay configuration, bypass, and pump management **writable** (select/switch); otherwise the same data is shown as **read-only sensors**. The same `unique_id` format is shared between the writable/read-only version so history is preserved when toggling.
+- `installer_settings` ("Installer mode") → makes relay configuration, bypass, and pump management **writable** (select/switch); otherwise the same data is shown as **read-only sensors**. Both forms share one `unique_id`, but the entity registry is keyed by `(domain, platform, unique_id)` — so the domain change makes them two separate rows, and recorder history cannot follow across the toggle (an `entity_id` cannot change domain). Two passes keep the toggle clean: `_remove_stale_installer_mode_entities` runs before platform setup and deletes the side the current flag no longer creates, capturing the user-owned registry fields off it (name, icon, area, labels, aliases, hidden, and the `object_id`); `_restore_installer_mode_customizations` runs after `async_forward_entry_setups()` and re-applies them to the row that replaced it. So a renamed `binary_sensor.kitchen_bypass` becomes `switch.kitchen_bypass` instead of leaving an unavailable entity behind and coming back as `..._2`.
 
 **Business rules built into the entities:**
 - Max 2 active bypass zones per controller (enforced in `BypassEnableSwitch.async_turn_on`, raises `HomeAssistantError` otherwise)
@@ -224,7 +271,7 @@ cust_Controller1_Name: nere
 cust_wifi_device: ethernet
 cust_ip_device: 10.x.x.x
 cust_Enable_SW_Update: '1'
-cust_C1_T1_name: Renee lekrum
+cust_C1_T1_name: Lekrum
 cust_C1_T2_name: Hallen
 cust_C1_T3_name: Tv rum
 cust_C1_T4_name: Gammla Kontor
@@ -236,10 +283,10 @@ cust_Enable_Low_Temp_Alarm: '0'
 cust_Low_temperature_Hyst: '90'
 cust_SW_version_update: X245_122.hex
 cust_Succesfull_SW_Instal: '1'
-cust_C2_T1_name: Emmas gammla
-cust_C2_T2_name: Sovrum R&F
+cust_C2_T1_name: Gammla rummet
+cust_C2_T2_name: Sovrum 1
 cust_Controller2_Name: uppe
-cust_C2_T3_name: Sovrum olivia
+cust_C2_T3_name: Sovrum 2
 cust_C2_T4_name: Allrum
 cust_C2_T5_name: Kontor
 cust_C2_T6_name: Badrum uppe
@@ -1563,17 +1610,58 @@ The integration supports the **Uponor Smatrix Wave Pulse (X-265)** and **Uponor 
 
 ### Thermostat model identification
 
-The JNAP gateway doesn't expose the thermostat's model name directly — only a serial number (`C?_thermostatN_id`) and a raw hardware type code (`C?_T?_thermostat_type`). The integration guesses the model from these in [`_detect_thermostat_model()`](custom_components/uponorx265/__init__.py) (`__init__.py`):
+The Smatrix ranges run in parallel — Base Pulse (X-245) has T-141/143/144/145/146/148/149,
+Wave Pulse (X-265) has T-161/162/163/165/166/168/169 — and the paired models
+(T-146↔T-166, T-148↔T-168, T-149↔T-169) report the **same** `C?_T?_thermostat_type`. So that
+code alone can never name a model. Identification is therefore two steps: resolve the product
+series, then read the thermostat's own hardware type within it.
 
-- The hardware type code (`hwid`) is the first selection criterion:
-  - `hwid == 2` → **T-146** (field-confirmed on `sn` prefix `285`).
-  - `hwid == 0` → the T-144/T-145 family, which shares the same `hwid` and needs to be told apart via the serial number.
-- For `hwid == 0`, the serial number's first 4 digits (`sn`) are split into a prefix (`prodk`, first 3 digits) and a last digit (`mod`):
-  - **Known rule:** prefix `269` → last digit `1` = T-144, last digit `2` = T-145.
-  - **Catch-all:** every other `hwid == 0` unit (unknown prefix, or `269` with a different last digit) defaults to **T-145** — the same behavior Uponor's own app seems to have when it can't tell them apart either. Prefix `268` (field-confirmed, `sn "2688"`) is already covered by the catch-all but keeps its own branch as a marker, in case a pattern emerges once more thermostats report in.
-- If identification isn't possible at all (e.g. a missing `thermostat_type` variable), it falls back to the last cached model (`get_thermostat_model()`), and ultimately `None` — HA then shows no model for the device, but functionality is unaffected (only the `DIAL_THERMOSTAT_MODELS` gating, see `requires_local_override()`).
+**Step 1 — the series** (`get_product_series()`):
 
-This is reverse-engineering without access to Uponor's official serial number scheme — so there's no guarantee the `hwid`/prefix pattern holds for hardware we haven't seen yet. New hardware is logged via the `dump_hardware_info` service (`sn_start`, `hardware_type_raw`, `detected_model`) and can be submitted to refine the rules above.
+1. `cust_SW_version_update` is the controller's firmware image name and states the model
+   outright: `X265_121.hex` → Wave, `X245_122.hex` → Base. This is a read, not an inference,
+   so it is tried first.
+2. Failing that, `C?_hardware_type`: `1` → Wave, `0` → Base. Agrees with the firmware name on
+   every system observed.
+
+**Step 2 — the model** (`_detect_thermostat_model()`), keyed on `(series, C?_T?_hw_type)`:
+
+| series | `hw_type` | model | evidence |
+|---|---|---|---|
+| Wave | `7` | T-169 | owner-confirmed, [issue #36](https://github.com/dave-code-ruiz/uponorX265/issues/36) (16 units); second Wave system in `homey-uponor` `examples/output_3.json` |
+| Base | `3` | T-146 | `homey-uponor` `examples/output_1.json`; matches the owner-confirmed T-146 profile in [issue #29](https://github.com/dave-code-ruiz/uponorX265/issues/29) |
+
+`thermostat_type == 0` is the dial family. T-144 and T-145 share both `thermostat_type` and
+`hw_type`, so the serial number is still the only thing separating them: prefix `269` with last
+digit `1` = T-144, everything else on a **Base** system = T-145 (the same thing Uponor's own app
+appears to do when it cannot tell). That rule is field-confirmed on Base units only, so it is not
+applied to a Wave system — a Wave dial (T-165) has never been observed and reports no model
+rather than borrowing a Base label.
+
+**Anything not in the table returns `None`.** A device with no model shown is strictly better
+than one confidently mislabelled: before this, every `thermostat_type == 2` unit on every system
+was reported as T-146, including sixteen T-169s. Unrecognised units are logged at DEBUG with
+their full signature (series, `thermostat_type`, `hw_type`, serial prefix, capability flags) so
+they can be reported and mapped. `dump_hardware_info` exposes the same fields as a service
+response.
+
+> **These codes are not documented by Uponor.** The table is derived from field data across five
+> systems; no public source maps them. Two combinations are pinned by owner confirmation, and the
+> RH-bearing Base models (T-148/T-149) and the remaining Wave models (T-165/T-166/T-168) have
+> never been observed and are deliberately absent.
+
+Model detection is **not** keyed on humidity or floor-temperature readings. `has_humidity_sensor()`
+is `C?_T?_rh != 0` and `has_floor_temperature()` is `C?_T?_external_temperature != 32767` — both
+report what a unit is currently *sensing*, not what it is *capable of*. A T-146 with no RH sensor
+and a T-169 sitting at 0% RH are indistinguishable that way, and a floor sensor that simply is not
+wired reads identically to a model that cannot take one. They remain fine as heuristics for
+deciding which entities to create; they are not evidence of a model.
+
+**Controller model.** `get_controller_hardware()` returns X-265 or X-245 from the same series
+resolution. The controller serial prefix does *not* discriminate: `4194` has been observed on both
+Wave and Base controllers across four systems. Note also that the gateway device's model is
+`R-208`, the communication module — correct, but shared by both Pulse families, so it carries no
+series information either.
 
 ### Component descriptions (from Uponor's installation manual)
 
