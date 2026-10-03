@@ -58,6 +58,7 @@ from .jnap import UponorJnap
 from .helper import (
     get_unique_id_from_config_entry,
     _async_get_device_by_identifier,
+    _device_config_entry_ids,
     _via_device_kwargs,
 )
 
@@ -119,7 +120,7 @@ def _resolve_target_proxies(hass: HomeAssistant, call) -> list:
         device = dev_reg.async_get(device_id)
         if device is None:
             continue
-        for entry_id in device.config_entries:
+        for entry_id in _device_config_entry_ids(device):
             entry = hass.config_entries.async_get_entry(entry_id)
             if entry and entry.domain == DOMAIN and entry.unique_id in all_proxies:
                 targeted[entry.unique_id] = all_proxies[entry.unique_id]

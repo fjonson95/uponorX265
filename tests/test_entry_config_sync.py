@@ -18,6 +18,7 @@ from homeassistant.helpers import device_registry as dr, entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.uponorx265 import _sync_entry_config
+from custom_components.uponorx265.helper import _device_config_entry_ids
 from custom_components.uponorx265.const import (
     CONF_BINARY_SENSOR_VALVE,
     CONF_CONTROLLER_IO,
@@ -127,6 +128,6 @@ async def test_registries_survive_a_data_options_mismatch(hass):
     surviving = ent_reg.async_get(registry_entry.entity_id)
     assert surviving is not None, "entity registry row was deleted by the config sync"
     assert surviving.name == "Boiler room gateway", "the user's custom name was lost"
-    assert entry.entry_id in dev_reg.async_get(device.id).config_entries, (
+    assert entry.entry_id in _device_config_entry_ids(dev_reg.async_get(device.id)), (
         "device lost its config entry association"
     )

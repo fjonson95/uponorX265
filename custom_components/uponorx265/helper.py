@@ -82,6 +82,27 @@ def _async_get_device_by_identifier(
     return dev_reg.async_get_device(identifiers={identifier})
 
 
+def _device_config_entry_ids(device: device_registry.DeviceEntry) -> set[str]:
+    """The ids of the config entries a device belongs to.
+
+    A device belongs to exactly one config entry on current cores, exposed as
+    `config_entry_id`. The `config_entries` set it replaced is deprecated, and
+    reading it raises a RuntimeError on the newest cores - so it must not be
+    touched there, not even to check whether it exists.
+
+    On older cores `config_entry_id` doesn't exist and the set is the only
+    thing available. Checking for the new attribute first, rather than
+    comparing version numbers, keeps this tied to what the device entry
+    actually offers.
+
+    Drop this shim (and use `device.config_entry_id` directly) once the
+    integration requires a core with the single-entry device model.
+    """
+    if hasattr(device, "config_entry_id"):
+        return {device.config_entry_id} if device.config_entry_id else set()
+    return set(device.config_entries)
+
+
 # `via_device` (the parent's identifier tuple) was deprecated in HA 2026.9 in
 # favour of `via_device_id` (the parent's registry id), which landed in 2026.8.
 # Checking the signature keeps this tied to the parameter actually being asked
