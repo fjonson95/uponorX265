@@ -83,24 +83,32 @@ def _async_get_device_by_identifier(
 
 
 def _device_config_entry_ids(device: device_registry.DeviceEntry) -> set[str]:
-    """The ids of the config entries a device belongs to.
+    """Every config entry a device belongs to.
 
-    A device belongs to exactly one config entry on current cores, exposed as
-    `config_entry_id`. The `config_entries` set it replaced is deprecated, and
-    reading it raises a RuntimeError on the newest cores - so it must not be
-    touched there, not even to check whether it exists.
+    HA 2026.8 restricted a device to a single config entry and gave it
+    `config_entry_id`; HA 2026.10 deprecated the set-valued `config_entries`
+    that field replaces, and it breaks in HA 2027.10.
 
-    On older cores `config_entry_id` doesn't exist and the set is the only
-    thing available. Checking for the new attribute first, rather than
-    comparing version numbers, keeps this tied to what the device entry
-    actually offers.
+    A set is returned regardless, because one case still has several. A device
+    id recorded before 2026.8 for a device that several integrations shared -
+    an automation may well still hold one - resolves through `async_get` to a
+    read-only composite of the devices it was split into. `config_entries` is
+    how core exposes all of a composite's entries, and reading it there is not
+    reported as deprecated. Core can only be asked whether a device is a
+    composite from 2026.10 on; on 2026.8 and 2026.9 one resolves to its former
+    primary entry alone.
 
-    Drop this shim (and use `device.config_entry_id` directly) once the
-    integration requires a core with the single-entry device model.
+    On cores older than 2026.8 `config_entry_id` does not exist and
+    `config_entries` is the only field there is.
+
+    Drop this shim (and read `config_entry_id` directly) once the integration
+    requires 2026.8 or newer and core no longer has composite devices.
     """
-    if hasattr(device, "config_entry_id"):
-        return {device.config_entry_id} if device.config_entry_id else set()
-    return set(device.config_entries)
+    if hasattr(device, "config_entry_id") and not getattr(
+        device, "is_composite_device", False
+    ):
+        return {device.config_entry_id}
+    return device.config_entries
 
 
 # `via_device` (the parent's identifier tuple) was deprecated in HA 2026.9 in
