@@ -906,10 +906,10 @@ class UponorStateProxy:
         var = controller.replace('C','sys_controller_') + '_lost'
         if var in self._data and self._data[var] == "1":
             return STATUS_ERROR_CONTROLER
-        var = controller + 'stat_out_module_com_lost'
+        var = controller + '_stat_out_module_com_lost'
         if var in self._data and self._data[var] == "1":
             return STATUS_ERROR_COMFAILOUT
-        var = controller + 'stat_general_system_alarm'
+        var = controller + '_stat_general_system_alarm'
         if var in self._data and self._data[var] == "1":
             return STATUS_ERROR_GENERAL
         return STATUS_OK
